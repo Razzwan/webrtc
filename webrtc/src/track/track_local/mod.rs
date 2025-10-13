@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod track_local_static_test;
 
+pub mod packet_cache;
+pub mod track_local_simple;
 pub mod track_local_static_rtp;
 pub mod track_local_static_sample;
 
@@ -10,7 +12,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use interceptor::{Attributes, RTPWriter};
+use interceptor::RTPWriter;
 use portable_atomic::AtomicBool;
 use smol_str::SmolStr;
 use tokio::sync::Mutex;
@@ -23,25 +25,13 @@ use crate::rtp_transceiver::*;
 /// TrackLocalWriter is the Writer for outbound RTP Packets
 #[async_trait]
 pub trait TrackLocalWriter: fmt::Debug {
-    /// write_rtp_with_attributes encrypts a RTP packet and writes to the connection.
-    /// attributes are delivered to the interceptor chain
-    async fn write_rtp_with_attributes(
-        &self,
-        pkt: &rtp::packet::Packet,
-        attr: &Attributes,
-    ) -> Result<usize>;
-
     /// write_rtp encrypts a RTP packet and writes to the connection
-    async fn write_rtp(&self, pkt: &rtp::packet::Packet) -> Result<usize> {
-        let attr = Attributes::new();
-        self.write_rtp_with_attributes(pkt, &attr).await
-    }
+    async fn write_rtp(&self, pkt: &rtp::packet::Packet) -> Result<usize>;
 
     /// write encrypts and writes a full RTP packet
     async fn write(&self, mut b: &[u8]) -> Result<usize> {
         let pkt = rtp::packet::Packet::unmarshal(&mut b)?;
-        let attr = Attributes::new();
-        self.write_rtp_with_attributes(&pkt, &attr).await
+        self.write_rtp(&pkt).await
     }
 }
 
@@ -146,6 +136,10 @@ impl TrackBinding {
     pub fn is_sender_paused(&self) -> bool {
         self.sender_paused.load(Ordering::SeqCst)
     }
+
+    pub fn set_sender_paused(&self, sender_paused: bool) {
+        self.sender_paused.store(sender_paused, Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct InterceptorToTrackLocalWriter {
@@ -174,18 +168,14 @@ impl std::fmt::Debug for InterceptorToTrackLocalWriter {
 
 #[async_trait]
 impl TrackLocalWriter for InterceptorToTrackLocalWriter {
-    async fn write_rtp_with_attributes(
-        &self,
-        pkt: &rtp::packet::Packet,
-        attr: &Attributes,
-    ) -> Result<usize> {
+    async fn write_rtp(&self, pkt: &rtp::packet::Packet) -> Result<usize> {
         if self.is_sender_paused() {
             return Ok(0);
         }
 
         let interceptor_rtp_writer = self.interceptor_rtp_writer.lock().await;
         if let Some(writer) = &*interceptor_rtp_writer {
-            Ok(writer.write(pkt, attr).await?)
+            Ok(writer.write(pkt).await?)
         } else {
             Ok(0)
         }

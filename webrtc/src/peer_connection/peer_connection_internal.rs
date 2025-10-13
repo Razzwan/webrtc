@@ -3,6 +3,7 @@ use std::sync::Weak;
 
 use super::*;
 use crate::api::setting_engine::SctpMaxMessageSize;
+use crate::rtp_transceiver::rtp_codec::RTCRtpCodecParameters;
 use crate::rtp_transceiver::{create_stream_info, PayloadType};
 use crate::stats::stats_collector::StatsCollector;
 use crate::stats::{
@@ -338,7 +339,14 @@ impl PeerConnectionInternal {
                         return;
                     }
                     Err(err) => {
-                        log::warn!("Failed to accept RTP {err}");
+                        match err {
+                            // Если агент уже закрыт, то не показываем сообщение об ошибке
+                            srtp::Error::SessionSrtpAlreadyClosed => {}
+                            _ => {
+                                log::warn!("Failed to accept RTP {err}");
+                            }
+                        }
+
                         return;
                     }
                 };
@@ -404,7 +412,14 @@ impl PeerConnectionInternal {
                             );
                         }
                         Err(err) => {
-                            log::warn!("Failed to accept RTCP {err}");
+                            match err {
+                                // TODO: убедиться, что нет проблемы с этим кодом
+                                srtp::Error::SessionSrtpAlreadyClosed => {}
+                                _ => {
+                                    log::warn!("Failed to accept RTCP {err}");
+                                }
+                            }
+
                             return;
                         }
                     };
@@ -635,6 +650,107 @@ impl PeerConnectionInternal {
             Some(Box::new(self.make_negotiation_needed_trigger())),
         )
         .await)
+    }
+
+    pub(super) async fn add_transceiver_from_params(
+        &self,
+        direction: RTCRtpTransceiverDirection,
+        kind: RTPCodecType,
+        stream_id: String,
+        ssrc: u32,
+        codecs: Vec<RTCRtpCodecParameters>,
+    ) -> Result<Arc<RTCRtpTransceiver>> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(Error::ErrConnectionClosed);
+        }
+
+        let t = match direction {
+            RTCRtpTransceiverDirection::Sendonly | RTCRtpTransceiverDirection::Sendrecv => {
+                let interceptor = self
+                    .interceptor
+                    .upgrade()
+                    .ok_or(Error::ErrInterceptorNotBind)?;
+
+                if direction == RTCRtpTransceiverDirection::Unspecified {
+                    return Err(Error::ErrPeerConnAddTransceiverFromTrackSupport);
+                }
+
+                let r = Arc::new(RTCRtpReceiver::new(
+                    self.setting_engine.get_receive_mtu(),
+                    kind,
+                    Arc::clone(&self.dtls_transport),
+                    Arc::clone(&self.media_engine),
+                    Arc::clone(&interceptor),
+                ));
+
+                let s = Arc::new(
+                    RTCRtpSender::new_by_ssrc(
+                        kind,
+                        Arc::clone(&self.dtls_transport),
+                        Arc::clone(&self.media_engine),
+                        Arc::clone(&self.setting_engine),
+                        Arc::clone(&interceptor),
+                        false,
+                        stream_id,
+                        ssrc,
+                    )
+                    .await,
+                );
+
+                RTCRtpTransceiver::new(
+                    r,
+                    s,
+                    direction,
+                    kind,
+                    codecs,
+                    Arc::clone(&self.media_engine),
+                    Some(Box::new(self.make_negotiation_needed_trigger())),
+                )
+                .await
+            }
+            RTCRtpTransceiverDirection::Recvonly => {
+                let interceptor = self
+                    .interceptor
+                    .upgrade()
+                    .ok_or(Error::ErrInterceptorNotBind)?;
+                let receiver = Arc::new(RTCRtpReceiver::new(
+                    self.setting_engine.get_receive_mtu(),
+                    kind,
+                    Arc::clone(&self.dtls_transport),
+                    Arc::clone(&self.media_engine),
+                    Arc::clone(&interceptor),
+                ));
+
+                let sender = Arc::new(
+                    RTCRtpSender::new(
+                        None,
+                        kind,
+                        Arc::clone(&self.dtls_transport),
+                        Arc::clone(&self.media_engine),
+                        Arc::clone(&self.setting_engine),
+                        interceptor,
+                        false,
+                    )
+                    .await,
+                );
+
+                RTCRtpTransceiver::new(
+                    receiver,
+                    sender,
+                    direction,
+                    kind,
+                    vec![],
+                    Arc::clone(&self.media_engine),
+                    Some(Box::new(self.make_negotiation_needed_trigger())),
+                )
+                .await
+            }
+            _ => return Err(Error::ErrPeerConnAddTransceiverFromKindSupport),
+        };
+
+        self.add_rtp_transceiver(Arc::clone(&t)).await;
+
+        Ok(t)
     }
 
     /// add_rtp_transceiver appends t into rtp_transceivers
@@ -1101,20 +1217,18 @@ impl PeerConnectionInternal {
 
         // Packets that we read as part of simulcast probing that we need to make available
         // if we do find a track later.
-        let mut buffered_packets: VecDeque<(rtp::packet::Packet, Attributes)> = VecDeque::default();
+        let mut buffered_packets: VecDeque<rtp::packet::Packet> = VecDeque::default();
         let mut buf = vec![0u8; self.setting_engine.get_receive_mtu()];
 
         for _ in 0..=SIMULCAST_PROBE_COUNT {
-            let (pkt, a) = rtp_interceptor
-                .read(&mut buf, &stream_info.attributes)
-                .await?;
+            let pkt = rtp_interceptor.read(&mut buf).await?;
             let (mid, rid, rsid) = get_stream_mid_rid(
                 &pkt.header,
                 mid_extension_id as u8,
                 sid_extension_id as u8,
                 rsid_extension_id as u8,
             )?;
-            buffered_packets.push_back((pkt, a.clone()));
+            buffered_packets.push_back(pkt);
 
             if mid.is_empty() || (rid.is_empty() && rsid.is_empty()) {
                 continue;
@@ -1196,7 +1310,7 @@ impl PeerConnectionInternal {
             tokio::spawn(async move {
                 let mut b = vec![0u8; receive_mtu];
                 let pkt = match track.peek(&mut b).await {
-                    Ok((pkt, _)) => pkt,
+                    Ok(pkt) => pkt,
                     Err(err) => {
                         log::warn!(
                             "Could not determine PayloadType for SSRC {} ({})",
@@ -1535,11 +1649,7 @@ type IResult<T> = std::result::Result<T, interceptor::Error>;
 
 #[async_trait]
 impl RTCPWriter for PeerConnectionInternal {
-    async fn write(
-        &self,
-        pkts: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
-        _a: &Attributes,
-    ) -> IResult<usize> {
+    async fn write(&self, pkts: &[Box<dyn rtcp::packet::Packet + Send + Sync>]) -> IResult<usize> {
         Ok(self.dtls_transport.write_rtcp(pkts).await?)
     }
 }

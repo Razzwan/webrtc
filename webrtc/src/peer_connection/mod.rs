@@ -27,7 +27,7 @@ use ::sdp::description::session::*;
 use ::sdp::util::ConnectionRole;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use interceptor::{stats, Attributes, Interceptor, RTCPWriter};
+use interceptor::{stats, Interceptor, RTCPWriter};
 use peer_connection_internal::*;
 use portable_atomic::{AtomicBool, AtomicU64, AtomicU8};
 use rand::{rng, Rng};
@@ -76,7 +76,9 @@ use crate::peer_connection::sdp::*;
 use crate::peer_connection::signaling_state::{
     check_next_signaling_state, RTCSignalingState, StateChangeOp,
 };
-use crate::rtp_transceiver::rtp_codec::{RTCRtpHeaderExtensionCapability, RTPCodecType};
+use crate::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RTPCodecType,
+};
 use crate::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 use crate::rtp_transceiver::rtp_sender::RTCRtpSender;
 use crate::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
@@ -1805,6 +1807,19 @@ impl RTCPeerConnection {
         self.internal.add_transceiver_from_kind(kind, init).await
     }
 
+    pub async fn add_transceiver_from_params(
+        &self,
+        direction: RTCRtpTransceiverDirection,
+        kind: RTPCodecType,
+        stream_id: String,
+        ssrc: u32,
+        codecs: Vec<RTCRtpCodecParameters>,
+    ) -> Result<Arc<RTCRtpTransceiver>> {
+        self.internal
+            .add_transceiver_from_params(direction, kind, stream_id, ssrc, codecs)
+            .await
+    }
+
     /// add_transceiver_from_track Create a new RtpTransceiver(SendRecv or SendOnly) and add it to the set of transceivers.
     pub async fn add_transceiver_from_track(
         &self,
@@ -1917,8 +1932,7 @@ impl RTCPeerConnection {
         &self,
         pkts: &[Box<dyn rtcp::packet::Packet + Send + Sync>],
     ) -> Result<usize> {
-        let a = Attributes::new();
-        Ok(self.interceptor_rtcp_writer.write(pkts, &a).await?)
+        Ok(self.interceptor_rtcp_writer.write(pkts).await?)
     }
 
     /// close ends the PeerConnection
