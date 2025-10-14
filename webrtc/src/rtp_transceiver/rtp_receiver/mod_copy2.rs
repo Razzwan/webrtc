@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwapOption;
 use interceptor::stream_info::{AssociatedStreamInfo, RTPHeaderExtension};
 use interceptor::Interceptor;
+use log::trace;
 use smol_str::SmolStr;
 use tokio::sync::{watch, Mutex, RwLock};
 
@@ -167,52 +168,51 @@ impl RTPReceiverInternal {
         // isn't flowing.
         State::wait_for(&mut state_watch_rx, &[State::Started, State::Paused]).await?;
 
-        // let tracks = self.tracks.read().await;
-        // if let Some(t) = tracks.first() {
-        //     if let Some(rtcp_interceptor) = &t.stream.rtcp_interceptor {
-        //         loop {
-        //             tokio::select! {
-        //                 res = State::error_on_close(&mut state_watch_rx) => {
-        //                     res?
-        //                 }
-        //                 result = rtcp_interceptor.read(b) => {
-        //                     return Ok(result?)
-        //                 }
-        //             }
-        //         }
-        //     } else {
-        //         Err(Error::ErrInterceptorNotBind)
-        //     }
-        // } else {
-        //     Err(Error::ErrExistingTrack)
-        // }
-
-        // Это работает чуть быстрее, чем если использовать код выше
-        let rtcp_interceptor = {
-            let tracks = self.tracks.read().await; // Блокировка захвачена
-
-            // TODO: возможно, нужна логика выбора трека на основе симулкаст предпочтения
-            // Вместо того, чтоб просто брать первый трек, или читать оповещения от всех треков
-            tracks
-                .first()
-                .ok_or(Error::ErrExistingTrack)?
-                .stream
-                .rtcp_interceptor
-                .as_ref()
-                .ok_or(Error::ErrInterceptorNotBind)?
-                .clone()
-        };
-
-        loop {
-            tokio::select! {
-                res = State::error_on_close(&mut state_watch_rx) => {
-                    res?
+        let tracks = self.tracks.read().await;
+        if let Some(t) = tracks.first() {
+            if let Some(rtcp_interceptor) = &t.stream.rtcp_interceptor {
+                loop {
+                    tokio::select! {
+                        res = State::error_on_close(&mut state_watch_rx) => {
+                            res?
+                        }
+                        result = rtcp_interceptor.read(b) => {
+                            return Ok(result?)
+                        }
+                    }
                 }
-                result = rtcp_interceptor.read(b) => {
-                    return Ok(result?)
-                }
+            } else {
+                Err(Error::ErrInterceptorNotBind)
             }
+        } else {
+            Err(Error::ErrExistingTrack)
         }
+
+        // let rtcp_interceptor = {
+        //     let tracks = self.tracks.read().await; // Блокировка захвачена
+
+        //     // TODO: возможно, нужна логика выбора трека на основе симулкаст предпочтения
+        //     // Вместо того, чтоб просто брать первый трек, или читать оповещения от всех треков
+        //     tracks
+        //         .first()
+        //         .ok_or(Error::ErrExistingTrack)?
+        //         .stream
+        //         .rtcp_interceptor
+        //         .as_ref()
+        //         .ok_or(Error::ErrInterceptorNotBind)?
+        //         .clone()
+        // };
+
+        // loop {
+        //     tokio::select! {
+        //         res = State::error_on_close(&mut state_watch_rx) => {
+        //             res?
+        //         }
+        //         result = rtcp_interceptor.read(b) => {
+        //             return Ok(result?)
+        //         }
+        //     }
+        // }
     }
 
     /// read_simulcast reads incoming RTCP for this RTPReceiver for given rid
@@ -256,8 +256,9 @@ impl RTPReceiverInternal {
         receive_mtu: usize,
     ) -> Result<Vec<Box<dyn rtcp::packet::Packet + Send + Sync>>> {
         let mut b = vec![0u8; receive_mtu];
+        let pkts = self.read(&mut b).await?;
 
-        Ok(self.read(&mut b).await?)
+        Ok(pkts)
     }
 
     /// read_simulcast_rtcp is a convenience method that wraps ReadSimulcast and unmarshal for you
@@ -273,122 +274,60 @@ impl RTPReceiverInternal {
     }
 
     pub(crate) async fn read_rtp(&self, b: &mut [u8], tid: usize) -> Result<rtp::packet::Packet> {
-        // println!("Начали чтение");
-        // let mut state_watch_rx = self.state_tx.subscribe();
-
-        // // Ensure we are running.
-        // State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
-
-        // //log::debug!("read_rtp enter tracks tid {}", tid);
-        // let mut rtp_interceptor = None;
-        // //let mut ssrc = 0;
-        // {
-        //     let tracks = self.tracks.read().await;
-        //     for t in &*tracks {
-        //         if t.track.tid() == tid {
-        //             rtp_interceptor.clone_from(&t.stream.rtp_interceptor);
-        //             //ssrc = t.track.ssrc();
-        //             break;
-        //         }
-        //     }
-        // };
-        // /*log::debug!(
-        //     "read_rtp exit tracks with rtp_interceptor {} with tid {}",
-        //     rtp_interceptor.is_some(),
-        //     tid,
-        // );*/
-        // if let Some(rtp_interceptor) = rtp_interceptor {
-        //     //println!(
-        //     //    "read_rtp rtp_interceptor.read enter with tid {} ssrc {}",
-        //     //    tid, ssrc
-        //     //);
-        //     let mut current_state = *state_watch_rx.borrow();
-        //     loop {
-        //         tokio::select! {
-        //             _ = state_watch_rx.changed() => {
-        //                 let new_state = *state_watch_rx.borrow();
-
-        //                 if new_state == State::Stopped {
-        //                     return Err(Error::ErrClosedPipe);
-        //                 }
-        //                 current_state = new_state;
-        //             }
-        //             result = rtp_interceptor.read(b) => {
-        //                 let result = result?;
-
-        //                 if current_state == State::Paused {
-        //                     log::trace!("Dropping {} read bytes received while RTPReceiver was paused", result);
-        //                     continue;
-        //                 }
-        //                 return Ok(result);
-        //             }
-        //         }
-        //     }
-        // } else {
-        //     //log::debug!("read_rtp exit tracks with ErrRTPReceiverWithSSRCTrackStreamNotFound");
-        //     Err(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)
-        // }
-
         let mut state_watch_rx = self.state_tx.subscribe();
 
         // Ensure we are running.
         State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
 
-        // println!("read_rtp enter tracks tid {}", tid);
-        let rtp_interceptor = {
+        //log::debug!("read_rtp enter tracks tid {}", tid);
+        let mut rtp_interceptor = None;
+        //let mut ssrc = 0;
+        {
             let tracks = self.tracks.read().await;
-            tracks
-                .iter()
-                .find(|t| t.track.tid() == tid)
-                .ok_or(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)?
-                .stream
-                .rtp_interceptor
-                .as_ref()
-                .ok_or(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)?
-                .clone()
-        };
-
-        loop {
-            let current_state = *state_watch_rx.borrow();
-
-            match current_state {
-                State::Stopped => {
-                    return Err(Error::ErrClosedPipe);
-                }
-                State::Started => {}
-                _ => {
-                    State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
+            for t in &*tracks {
+                if t.track.tid() == tid {
+                    rtp_interceptor.clone_from(&t.stream.rtp_interceptor);
+                    //ssrc = t.track.ssrc();
+                    break;
                 }
             }
+        };
+        /*log::debug!(
+            "read_rtp exit tracks with rtp_interceptor {} with tid {}",
+            rtp_interceptor.is_some(),
+            tid,
+        );*/
 
-            tokio::select! {
-                res = state_watch_rx.changed() => {
-                    if let Err(_) = res {
-                        return Err(Error::ErrClosedPipe);
-                    }
-                    let new_state = *state_watch_rx.borrow();
+        if let Some(rtp_interceptor) = rtp_interceptor {
+            //println!(
+            //    "read_rtp rtp_interceptor.read enter with tid {} ssrc {}",
+            //    tid, ssrc
+            //);
+            let mut current_state = *state_watch_rx.borrow();
+            loop {
+                tokio::select! {
+                    _ = state_watch_rx.changed() => {
+                        let new_state = *state_watch_rx.borrow();
 
-                    if new_state == State::Stopped {
-                        return Err(Error::ErrClosedPipe);
-                    }
-                    continue;
-                }
-                result = rtp_interceptor.read(b) => {
-                    let result = result?;
-
-                    let current_state = *state_watch_rx.borrow();
-                    match current_state {
-                        State::Stopped => {
+                        if new_state == State::Stopped {
                             return Err(Error::ErrClosedPipe);
                         }
-                        State::Paused => {
+                        current_state = new_state;
+                    }
+                    result = rtp_interceptor.read(b) => {
+                        let result = result?;
+
+                        if current_state == State::Paused {
+                            trace!("Dropping {} read bytes received while RTPReceiver was paused", result);
                             continue;
                         }
-                        _ => {}
+                        return Ok(result);
                     }
-                    return Ok(result);
                 }
             }
+        } else {
+            //log::debug!("read_rtp exit tracks with ErrRTPReceiverWithSSRCTrackStreamNotFound");
+            Err(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)
         }
     }
 

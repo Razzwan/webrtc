@@ -276,6 +276,17 @@ impl TrackRemote {
         Ok(pkt)
     }
 
+    // Не вызывает лишние блокировки, а всегда читает данные из receiver
+    pub async fn read_rtp_raw(&self) -> Result<rtp::packet::Packet> {
+        let receiver = match self.receiver.as_ref().and_then(|r| r.upgrade()) {
+            Some(r) => r,
+            None => return Err(Error::ErrRTPReceiverNil),
+        };
+
+        let mut b = vec![0u8; self.receive_mtu];
+        Ok(receiver.read_rtp(&mut b, self.tid).await?)
+    }
+
     /// peek is like Read, but it doesn't discard the packet read
     pub(crate) async fn peek(&self, b: &mut [u8]) -> Result<rtp::packet::Packet> {
         let pkt = self.read(b).await?;

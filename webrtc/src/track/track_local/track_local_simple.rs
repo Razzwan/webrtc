@@ -25,22 +25,12 @@ impl TrackLocalSimple {
 #[async_trait]
 impl TrackLocal for TrackLocalSimple {
     async fn bind(&self, _t: &TrackLocalContext) -> Result<RTCRtpCodecParameters> {
-        println!(
-            "TrackLocalSimple.bind: mid - {:?}; {:?}",
-            _t.mid(),
-            _t.ssrc()
-        );
         Ok(RTCRtpCodecParameters {
             ..Default::default()
         })
     }
 
     async fn unbind(&self, _t: &TrackLocalContext) -> Result<()> {
-        println!(
-            "TrackLocalSimple.unbind: mid-{:?}; {:?}",
-            _t.mid(),
-            _t.ssrc()
-        );
         Ok(())
     }
 

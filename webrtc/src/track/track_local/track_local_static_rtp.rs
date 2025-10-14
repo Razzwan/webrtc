@@ -1,26 +1,37 @@
 use bytes::{Bytes, BytesMut};
-use rtp::packet::Packet;
+use dashmap::DashMap;
 use std::any::Any;
 use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 use std::{borrow::Cow, collections::HashMap, time::Duration};
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use util::{Marshal, MarshalSize};
 
 use super::*;
+use crate::track::track_local::packet_cache::PCache;
 use crate::track::track_remote::TrackRemote;
 use crate::{error::flatten_errs, track::track_local::packet_cache::PCacheBuffer};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TrackState {
     last_out_seq: u16, // переживает все переключения источников
     last_out_ts: u32,  // переживает все переключения источников
     started_at_ts: i64,
-
+    marker: bool, // marker = true означает, что это последний пакет видеофрейма.
+    // Это сигнал для джиттер-буфера и декодера, что можно собрать все полученные пакеты этого фрейма и отправить их на декодирование.
+    // Используется после паузы
     out_offset: Option<(
         u16, /* смещение порядкового номера */
         u32, /* смещение временной метки timestamp */
     )>,
+}
+
+pub struct PkgAttrs {
+    sequence_number: u16,
+    timestamp: u32,
+    marker: bool,
 }
 
 impl TrackState {
@@ -33,21 +44,22 @@ impl TrackState {
             // Сохраняем начало трека в реальной временной шкале дла последующей синхронизации
             started_at_ts: chrono::Utc::now().timestamp(),
             out_offset: None,
+            marker: false,
         }
     }
 
-    pub fn apply_offset(
+    pub fn get_pkg_attrs(
         &mut self,
         kind: RTPCodecType,
         pkt_sequence_number: u16,
         pkt_timestamp: u32,
-    ) -> (u16, u32) {
+    ) -> PkgAttrs {
         match self.out_offset {
-            Some((seq_num_offset, ts_offset)) => {
-                self.last_out_seq = pkt_sequence_number.wrapping_add(seq_num_offset);
-                self.last_out_ts = pkt_timestamp.wrapping_add(ts_offset);
-                (self.last_out_seq, self.last_out_ts)
-            }
+            Some((seq_num_offset, ts_offset)) => PkgAttrs {
+                sequence_number: pkt_sequence_number.wrapping_add(seq_num_offset),
+                timestamp: pkt_timestamp.wrapping_add(ts_offset),
+                marker: self.marker,
+            },
             None => {
                 let seq_num_offset = self
                     .last_out_seq
@@ -63,14 +75,74 @@ impl TrackState {
                         });
                 self.out_offset = Some((seq_num_offset, ts_offset));
 
+                PkgAttrs {
+                    sequence_number: pkt_sequence_number.wrapping_add(seq_num_offset),
+                    timestamp: pkt_timestamp.wrapping_add(ts_offset),
+                    marker: self.marker,
+                }
+            }
+        }
+    }
+
+    pub fn set_last_out(&mut self, pkg_attrs: PkgAttrs) {
+        self.last_out_seq = pkg_attrs.sequence_number;
+        self.last_out_ts = pkg_attrs.timestamp;
+        self.marker = false;
+    }
+
+    pub fn shift_offset(&mut self, pkt_sequence_number: u16, pkt_timestamp: u32) {
+        self.marker = true;
+        self.out_offset = Some((
+            self.last_out_seq.wrapping_sub(pkt_sequence_number),
+            self.last_out_ts.wrapping_sub(pkt_timestamp),
+        ))
+    }
+
+    pub fn get_pkg_attrs_set_last_out(
+        &mut self,
+        kind: RTPCodecType,
+        pkt_sequence_number: u16,
+        pkt_timestamp: u32,
+    ) -> PkgAttrs {
+        match self.out_offset {
+            Some((seq_num_offset, ts_offset)) => {
+                // новый = пришедший + смещение
+                // старый = новый - (новый - старый)
+                self.last_out_seq = pkt_sequence_number.wrapping_add(seq_num_offset);
+                self.last_out_ts = pkt_timestamp.wrapping_add(ts_offset);
+                PkgAttrs {
+                    sequence_number: self.last_out_seq,
+                    timestamp: self.last_out_ts,
+                    marker: self.marker,
+                }
+            }
+            None => {
+                let seq_num_offset = self
+                    .last_out_seq
+                    .wrapping_sub(pkt_sequence_number)
+                    .wrapping_add(1);
+                let ts_offset =
+                    self.last_out_ts
+                        .wrapping_sub(pkt_timestamp)
+                        .wrapping_add(match kind {
+                            RTPCodecType::Audio => 900,  // стандартное значение для звука
+                            RTPCodecType::Video => 6000, // 90000 clock_rate / 24 кадра
+                            _ => 6000,
+                        });
+                self.out_offset = Some((seq_num_offset, ts_offset));
+
                 self.last_out_seq = pkt_sequence_number.wrapping_add(seq_num_offset);
                 self.last_out_ts = pkt_timestamp.wrapping_add(ts_offset);
 
-                println!(
-                    "Смещения перезаписаны seq_num: {pkt_sequence_number} -> {}; ts: {pkt_timestamp} -> {}",
-                    self.last_out_seq, self.last_out_ts
-                );
-                (self.last_out_seq, self.last_out_ts)
+                // println!(
+                //     "Смещения перезаписаны seq_num: {pkt_sequence_number} -> {}; ts: {pkt_timestamp} -> {}",
+                //     self.last_out_seq, self.last_out_ts
+                // );
+                PkgAttrs {
+                    sequence_number: self.last_out_seq,
+                    timestamp: self.last_out_ts,
+                    marker: self.marker,
+                }
             }
         }
     }
@@ -87,7 +159,7 @@ impl TrackState {
 /// If you wish to send a media.Sample use TrackLocalStaticSample
 #[derive(Debug)]
 pub struct TrackLocalStaticRTP {
-    pub(crate) bindings: Mutex<Vec<Arc<TrackBinding>>>,
+    pub(crate) bindings: DashMap<u32, Arc<TrackBinding>>,
     codec: RTCRtpCodecCapability,
     id: String,
     rid: Option<String>,
@@ -111,7 +183,7 @@ impl TrackLocalStaticRTP {
     pub fn new(codec: RTCRtpCodecCapability, id: String, stream_id: String) -> Self {
         TrackLocalStaticRTP {
             codec,
-            bindings: Mutex::new(vec![]),
+            bindings: DashMap::with_capacity(10),
             id,
             rid: None,
             stream_id,
@@ -123,7 +195,7 @@ impl TrackLocalStaticRTP {
             )),
 
             pli_last_ms: AtomicU64::new(0),
-            pli_interval_ms: 500,
+            pli_interval_ms: 1000,
         }
     }
 
@@ -136,7 +208,7 @@ impl TrackLocalStaticRTP {
     ) -> Self {
         TrackLocalStaticRTP {
             codec,
-            bindings: Mutex::new(vec![]),
+            bindings: DashMap::with_capacity(10),
             id,
             rid: Some(rid),
             stream_id,
@@ -158,30 +230,43 @@ impl TrackLocalStaticRTP {
     }
 
     pub async fn any_binding_paused(&self) -> bool {
-        let bindings = self.bindings.lock().await;
-        bindings
-            .iter()
-            .any(|b| b.sender_paused.load(Ordering::SeqCst))
+        self.bindings.iter().any(|entry| {
+            let binding = entry.value();
+            binding.sender_paused.load(Ordering::Relaxed)
+        })
     }
 
     pub async fn all_binding_paused(&self) -> bool {
-        let bindings = self.bindings.lock().await;
-        bindings
-            .iter()
-            .all(|b| b.sender_paused.load(Ordering::SeqCst))
+        self.bindings.iter().all(|entry| {
+            let binding = entry.value();
+            binding.sender_paused.load(Ordering::Relaxed)
+        })
     }
 
-    pub async fn is_binding_active(&self, binding_ssrc: u32) -> bool {
-        match {
-            let bindings = self.bindings.lock().await;
-            bindings
-                .iter()
-                .find(|b| b.ssrc == binding_ssrc)
-                .map(|b| b.clone())
-        } {
-            Some(b) => !b.is_sender_paused(),
+    pub fn all_binding_paused_sync(&self) -> bool {
+        self.bindings.iter().all(|entry| {
+            let binding = entry.value();
+            binding.sender_paused.load(Ordering::Relaxed)
+        })
+    }
+
+    pub fn is_binding_active(&self, binding_ssrc: u32) -> bool {
+        match self.bindings.get(&binding_ssrc) {
+            // 2. Если элемент найден...
+            Some(binding_ref) => !binding_ref.value().is_sender_paused(),
+            // 4. Если элемент не найден, возвращаем false.
             None => false,
         }
+    }
+
+    /// seq - Последовательный номер в терминах получателей
+    pub async fn cache_get(&self, seq: u16) -> Option<Arc<PCache>> {
+        // В кэше хранятся данные без изменений
+        self.rtp_cache.get_arc({
+            let st = self.state.lock().await;
+            // трансформируем в последовательный номер в терминах отправителя
+            st.origin_seq(seq)
+        })
     }
 
     /// Выполняется, когда мы изменяем источник данных для трека
@@ -196,35 +281,39 @@ impl TrackLocalStaticRTP {
         // 2. Запись из mpsc канала в local_track
         // здесь должен быть минимальный буфер,
         // т.к. лучше потом отправить из кеша, чем пытаться отправить застрявший пакет из очереди
-        let (rtp_sender, mut rtp_rx) = mpsc::channel::<Packet>(64);
+        let (rtp_sender, mut rtp_rx) = mpsc::channel::<Arc<PCache>>(64);
         let local_track = Arc::downgrade(&self);
         let rtp_writer = tokio::spawn(async move {
-            while let Some(pkt) = rtp_rx.recv().await {
+            while let Some(p_cache) = rtp_rx.recv().await {
                 if let Some(local_track) = local_track.upgrade() {
-                    if let Err(err) = local_track.write_rtp(&pkt).await {
-                        eprintln!("Ошибка записи данных в исходящий трек: {:?}", err);
+                    if let Err(_err) = local_track.write_rtp(&p_cache.rtp).await {
+                        // eprintln!("Ошибка записи данных в исходящий трек: {:?}", _err);
                     }
                 } else {
                     break;
                 }
             }
-            println!("Запись данных в трек остановлена!");
+            // println!("Запись данных в трек остановлена!");
         });
 
         // 3. Чтение из remote_track в mpsc канал
-        while let Ok(rtp) = remote_track.read_rtp().await {
+        while let Ok(rtp) = remote_track.read_rtp_raw().await {
             // 1. Сохраняем в кэш оригинальный rtp без смещений! Так быстрее происходит сохранение в кэш
             // При восстановлении кеша нужно вернуть порядковый номер к оригинальному, чтоб найти его
-            self.rtp_cache.put(rtp.clone());
+            let p_cache = Arc::new(PCache {
+                rtp,
+                first_sent_at: Instant::now(),
+            });
+            self.rtp_cache.put(Arc::clone(&p_cache));
 
             // 2. Пытаемся отправить, если переполнен буфер, не ждём и позже в ответ на NACK берём из кэша
             // Без ожиданий, чтоб не замедлять процесс получения пакетов
-            match rtp_sender.try_send(rtp) {
+            match rtp_sender.try_send(Arc::clone(&p_cache)) {
                 Err(TrySendError::Closed(_)) => {
                     break;
                 }
                 Err(TrySendError::Full(_)) => {
-                    eprintln!("Ошибка отправки RTP данных: Буфер переполнен");
+                    // eprintln!("Ошибка отправки RTP данных: Буфер переполнен");
                 }
                 _ => {}
             }
@@ -235,31 +324,22 @@ impl TrackLocalStaticRTP {
     }
 
     /// Получаем ssrc всех RTCPeerConnection подключений к этому треку
-    pub async fn bindings_ssrc(&self) -> Vec<u32> {
-        let bindings = self.bindings.lock().await;
-        bindings.iter().map(|b| b.ssrc).collect()
+    pub fn bindings_ssrc(&self) -> Vec<u32> {
+        self.bindings.iter().map(|b| b.key().clone()).collect()
     }
 
-    pub async fn bindings_ids(&self) -> Vec<String> {
-        let bindings = self.bindings.lock().await;
-        bindings.iter().map(|b| b.id.clone()).collect()
+    pub fn bindings_ids(&self) -> Vec<String> {
+        self.bindings.iter().map(|b| b.value().id.clone()).collect()
     }
 
     pub async fn write_rtp_with_extensions_to(
         &self,
         p: &rtp::packet::Packet,
+        pkt_attrs: &PkgAttrs,
         extensions: &[rtp::extension::HeaderExtension],
         binding_ssrc: u32,
     ) -> Result<usize> {
-        let binding = {
-            let bindings = self.bindings.lock().await;
-            bindings
-                .iter()
-                .find(|b| b.ssrc == binding_ssrc)
-                .map(|b| b.clone())
-        };
-
-        if let Some(b) = binding {
+        if let Some(b) = self.bindings.get(&binding_ssrc).map(|b| b.value().clone()) {
             // Prepare the extensions data
             let mut extension_error = None;
             let extension_data: HashMap<_, _> = extensions
@@ -283,7 +363,7 @@ impl TrackLocalStaticRTP {
                 return Err(err);
             }
 
-            self.write_rtp_with_extensions_to_binding(p, &extension_data, b)
+            self.write_rtp_with_extensions_to_binding(p, pkt_attrs, &extension_data, b)
                 .await
         } else {
             // Must return Ok(usize) to be consistent with write_rtp_with_extensions_attributes
@@ -296,27 +376,26 @@ impl TrackLocalStaticRTP {
         pkt: &rtp::packet::Packet,
         extensions: &[rtp::extension::HeaderExtension],
     ) -> Result<usize> {
-        let mut pkt = pkt.clone();
-
-        let (seq_number, timestamp) = {
+        if self.all_binding_paused_sync() {
+            // Если никто пакеты не получил, то меняем смещение так, чтоб не было пропущенных пакетов
             let mut st = self.state.lock().await;
-            st.apply_offset(
+            st.shift_offset(pkt.header.sequence_number, pkt.header.timestamp);
+            return Ok(0);
+        }
+        let pkg_attrs = {
+            let mut st = self.state.lock().await;
+            st.get_pkg_attrs_set_last_out(
                 self.kind(),
                 pkt.header.sequence_number,
                 pkt.header.timestamp,
             )
         };
 
-        pkt.header.sequence_number = seq_number;
-        pkt.header.timestamp = timestamp;
-
         let mut n = 0;
         let mut write_errs = vec![];
 
-        let bindings = {
-            let bindings = self.bindings.lock().await;
-            bindings.clone()
-        };
+        let bindings: Vec<Arc<TrackBinding>> =
+            self.bindings.iter().map(|b| b.value().clone()).collect();
         // Prepare the extensions data
         let extension_data: HashMap<_, _> = extensions
             .iter()
@@ -338,7 +417,7 @@ impl TrackLocalStaticRTP {
 
         for b in bindings.into_iter() {
             match self
-                .write_rtp_with_extensions_to_binding(&pkt, &extension_data, b)
+                .write_rtp_with_extensions_to_binding(&pkt, &pkg_attrs, &extension_data, b)
                 .await
             {
                 Ok(one_or_zero) => {
@@ -359,38 +438,30 @@ impl TrackLocalStaticRTP {
         pkt: &rtp::packet::Packet,
         binding_ssrc: u32,
     ) -> Result<usize> {
-        let mut pkt = pkt.clone();
-
-        let (seq_number, timestamp) = {
+        let pkg_attrs = {
             let mut st = self.state.lock().await;
-            st.apply_offset(
+            st.get_pkg_attrs(
                 self.kind(),
                 pkt.header.sequence_number,
                 pkt.header.timestamp,
             )
         };
 
-        pkt.header.sequence_number = seq_number;
-        pkt.header.timestamp = timestamp;
-        self.write_rtp_with_extensions_to(&pkt, &[], binding_ssrc)
+        self.write_rtp_with_extensions_to(&pkt, &pkg_attrs, &[], binding_ssrc)
             .await
     }
 
     pub async fn set_muted(&self, muted: bool) {
-        let bindings = {
-            let bindings = self.bindings.lock().await;
-            bindings.clone()
-        };
+        let bindings: Vec<Arc<TrackBinding>> =
+            self.bindings.iter().map(|b| b.value().clone()).collect();
         bindings.iter().for_each(|b| {
             b.set_sender_paused(muted);
         });
     }
 
     pub async fn set_muted_for(&self, bindings_ssrc: Vec<(u32, bool)>) {
-        let bindings = {
-            let bindings = self.bindings.lock().await;
-            bindings.clone()
-        };
+        let bindings: Vec<Arc<TrackBinding>> =
+            self.bindings.iter().map(|b| b.value().clone()).collect();
         bindings.iter().for_each(|b| {
             if let Some((_, muted)) = bindings_ssrc.iter().find(|(ssrc, _)| *ssrc == b.ssrc) {
                 b.set_sender_paused(*muted);
@@ -406,27 +477,33 @@ impl TrackLocalStaticRTP {
             }
             if self
                 .pli_last_ms
-                .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 return true;
             }
             // кто-то другой успел обновить last_ms — пробуем снова
+
+            // Мы проиграли гонку. Вместо того чтобы сразу бросаться в новую итерацию,
+            // дадим процессору подсказку.
+            std::hint::spin_loop();
         }
     }
 
     async fn write_rtp_with_extensions_to_binding(
         &self,
         p: &rtp::packet::Packet,
+        pkg_attrs: &PkgAttrs,
         extension_data: &HashMap<Cow<'static, str>, Bytes>,
         binidng: Arc<TrackBinding>,
     ) -> Result<usize> {
-        let mut pkt = p.clone();
-
         if binidng.is_sender_paused() {
-            // See caveat in function doc.
             return Ok(0);
         }
+
+        let mut pkt = p.clone();
+        pkt.header.sequence_number = pkg_attrs.sequence_number;
+        pkt.header.timestamp = pkg_attrs.timestamp;
         pkt.header.ssrc = binidng.ssrc;
         pkt.header.payload_type = binidng.payload_type;
 
@@ -461,11 +538,6 @@ impl TrackLocal for TrackLocalStaticRTP {
     /// This asserts that the code requested is supported by the remote peer.
     /// If so it setups all the state (SSRC and PayloadType) to have a call
     async fn bind(&self, t: &TrackLocalContext) -> Result<RTCRtpCodecParameters> {
-        println!(
-            "TrackLocalStaticRTP.bind: mid={:?}; ssrc={:?}",
-            t.mid(),
-            t.ssrc()
-        );
         let parameters = RTCRtpCodecParameters {
             capability: self.codec.clone(),
             ..Default::default()
@@ -500,16 +572,18 @@ impl TrackLocal for TrackLocalStaticRTP {
         let (codec, match_type) = codec_parameters_fuzzy_search(&parameters, t.codec_parameters());
         if match_type != CodecMatch::None {
             {
-                let mut bindings = self.bindings.lock().await;
-                bindings.push(Arc::new(TrackBinding {
-                    id: t.id(),
-                    ssrc: t.ssrc(),
-                    payload_type: codec.payload_type,
-                    params: t.params.clone(),
-                    write_stream: t.write_stream(),
-                    sender_paused: t.paused.clone(),
-                    hdr_ext_ids,
-                }));
+                self.bindings.insert(
+                    t.ssrc(),
+                    Arc::new(TrackBinding {
+                        id: t.id(),
+                        ssrc: t.ssrc(),
+                        payload_type: codec.payload_type,
+                        params: t.params.clone(),
+                        write_stream: t.write_stream(),
+                        sender_paused: t.paused.clone(),
+                        hdr_ext_ids,
+                    }),
+                );
             }
 
             Ok(codec)
@@ -521,25 +595,9 @@ impl TrackLocal for TrackLocalStaticRTP {
     /// unbind implements the teardown logic when the track is no longer needed. This happens
     /// because a track has been stopped.
     async fn unbind(&self, t: &TrackLocalContext) -> Result<()> {
-        println!(
-            "TrackLocalStaticRTP.unbind: mid={:?}; ssrc={:?}",
-            t.mid(),
-            t.ssrc()
-        );
-        let mut bindings = self.bindings.lock().await;
-        let mut idx = None;
-        for (index, binding) in bindings.iter().enumerate() {
-            if binding.id == t.id() {
-                idx = Some(index);
-                break;
-            }
-        }
-        if let Some(index) = idx {
-            bindings.remove(index);
-            Ok(())
-        } else {
-            Err(Error::ErrUnbindFailed)
-        }
+        self.bindings.remove(&t.ssrc());
+
+        Ok(())
     }
 
     /// id is the unique identifier for this Track. This should be unique for the
