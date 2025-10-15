@@ -1,7 +1,8 @@
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use rtcp::reception_report::ReceptionReport;
 use std::any::Any;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::Instant;
 use std::{borrow::Cow, collections::HashMap, time::Duration};
 use tokio::sync::mpsc;
@@ -10,6 +11,9 @@ use tokio::sync::Mutex;
 use util::{Marshal, MarshalSize};
 
 use super::*;
+use crate::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8};
+use crate::track::track_local::bitrate_state::BitrateState;
+use crate::track::track_local::loss_stats::{ReceiverLossStats, ReduceIncrease};
 use crate::track::track_local::packet_cache::PCache;
 use crate::track::track_remote::TrackRemote;
 use crate::{error::flatten_errs, track::track_local::packet_cache::PCacheBuffer};
@@ -170,6 +174,16 @@ pub struct TrackLocalStaticRTP {
 
     pli_last_ms: AtomicU64,
     pli_interval_ms: u64,
+
+    pub bitrate: Mutex<BitrateState>,
+    pub loss_stats: Mutex<ReceiverLossStats>,
+
+    pub max_bitrate_bps: u32,
+    pub current_target_bitrate_bps: AtomicU32, // Добавляем это поле
+
+    last_remb_sent: AtomicU64, // microseconds since start
+    start_remb_time: Instant,  // Референсное время
+    min_remb_interval: Duration,
 }
 
 /// Количество пакетов в кэше
@@ -178,9 +192,28 @@ const CAPACITY: usize = 256; // если 24 пакета в секунду, то
 /// TTL в миллисекундах, время через которое кэш становится невалидным
 const TTL_MILLIS: u64 = 3000;
 
+const PLI_INTERVAL_MS: u64 = 500;
+
+const MAX_VIDEO_BITRATE_BPS: u32 = 1_000_000;
+const MAX_AUDIO_BITRATE_BPS: u32 = 64_000;
+
+const REMB_INTERVAL: Duration = Duration::from_secs(1);
+
+fn get_max_bitrate(mime_type: &str) -> u32 {
+    match mime_type {
+        MIME_TYPE_OPUS => MAX_AUDIO_BITRATE_BPS,
+        MIME_TYPE_H264 | MIME_TYPE_VP8 => MAX_VIDEO_BITRATE_BPS,
+        x => panic!("Неподдерживаемый тип кодека! {}", x),
+    }
+}
+
 impl TrackLocalStaticRTP {
     /// returns a TrackLocalStaticRTP without rid.
     pub fn new(codec: RTCRtpCodecCapability, id: String, stream_id: String) -> Self {
+        let max_bitrate_bps = get_max_bitrate(&codec.mime_type);
+        let start_remb_time = Instant::now();
+        // Начинаем с "10 секунд назад", чтобы можно было отправить сразу
+        let initial_offset = Duration::from_secs(10).as_micros() as u64;
         TrackLocalStaticRTP {
             codec,
             bindings: DashMap::with_capacity(10),
@@ -195,7 +228,16 @@ impl TrackLocalStaticRTP {
             )),
 
             pli_last_ms: AtomicU64::new(0),
-            pli_interval_ms: 1000,
+            pli_interval_ms: PLI_INTERVAL_MS,
+
+            bitrate: Mutex::new(BitrateState::new()),
+            loss_stats: Mutex::new(ReceiverLossStats::new()),
+            max_bitrate_bps,
+            current_target_bitrate_bps: AtomicU32::new(max_bitrate_bps / 2),
+
+            last_remb_sent: AtomicU64::new(initial_offset),
+            start_remb_time,
+            min_remb_interval: REMB_INTERVAL,
         }
     }
 
@@ -206,6 +248,10 @@ impl TrackLocalStaticRTP {
         rid: String,
         stream_id: String,
     ) -> Self {
+        let max_bitrate_bps = get_max_bitrate(&codec.mime_type);
+        let start_remb_time = Instant::now();
+        // Начинаем с "10 секунд назад", чтобы можно было отправить сразу
+        let initial_offset = Duration::from_secs(10).as_micros() as u64;
         TrackLocalStaticRTP {
             codec,
             bindings: DashMap::with_capacity(10),
@@ -220,7 +266,16 @@ impl TrackLocalStaticRTP {
             )),
 
             pli_last_ms: AtomicU64::new(0),
-            pli_interval_ms: 500,
+            pli_interval_ms: PLI_INTERVAL_MS,
+
+            bitrate: Mutex::new(BitrateState::new()),
+            loss_stats: Mutex::new(ReceiverLossStats::new()),
+            max_bitrate_bps,
+            current_target_bitrate_bps: AtomicU32::new(max_bitrate_bps / 2),
+
+            last_remb_sent: AtomicU64::new(initial_offset),
+            start_remb_time,
+            min_remb_interval: REMB_INTERVAL,
         }
     }
 
@@ -529,6 +584,136 @@ impl TrackLocalStaticRTP {
         }
 
         binidng.write_stream.write_rtp(&pkt).await
+    }
+
+    pub async fn handle_receiver_report(&self, receiver_ssrc: u32, report: &ReceptionReport) {
+        let mut loss_stats_guard = self.loss_stats.lock().await;
+        loss_stats_guard.update_with_rr(
+            receiver_ssrc,
+            report.fraction_lost,
+            report.total_lost as i32,
+        );
+
+        // log::warn!(
+        //     "\nRR от получателя {} для SSRC {}: потери {}%",
+        //     receiver_ssrc,
+        //     report.ssrc,
+        //     report.fraction_lost
+        // );
+    }
+
+    pub fn should_send_remb(&self) -> bool {
+        let now_micros = self.instant_to_micros(Instant::now());
+        let last_micros = self.last_remb_sent.load(Ordering::Acquire);
+
+        if now_micros >= last_micros + self.min_remb_interval.as_micros() as u64 {
+            // CAS для thread safety
+            self.last_remb_sent
+                .compare_exchange(
+                    last_micros,
+                    now_micros,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    fn instant_to_micros(&self, instant: Instant) -> u64 {
+        instant.duration_since(self.start_remb_time).as_micros() as u64
+    }
+
+    // Используется для отправки REMB отчётов паблишеру трека
+    pub fn adapt_bitrate(&self) -> Option<u32> {
+        if !self.should_send_remb() {
+            return None;
+        }
+
+        let current_target = self.current_target_bitrate_bps.load(Ordering::Relaxed);
+        // Применяем изменение только если оно существенное (>5% изменения)
+        let change_threshold = current_target / 20;
+        // Выбираем минимально возможный размер битрейта (он же, шаг от изменения)
+        let min_bitrate = self.max_bitrate_bps / 20;
+
+        let real_bitrate = if let Ok(bitrate_guard) = self.bitrate.try_lock() {
+            bitrate_guard.average_bitrate()
+        } else {
+            return None;
+        };
+
+        // Защита от некорректных значений битрейта
+        if real_bitrate == 0 {
+            return None;
+        }
+
+        // Если реальный битрейт скакнул, то считать реальным битрейтом целевой битрейт,
+        // т.к. скачёк, скорее всего, случайный. Ведь не должно быть битрейта больше целевого
+        let real_bitrate = std::cmp::min(real_bitrate, current_target);
+
+        let should_reduce = if let Ok(loss_stats_guard) = self.loss_stats.try_lock() {
+            loss_stats_guard.should_reduce()
+        } else {
+            return None;
+        };
+
+        match should_reduce {
+            ReduceIncrease::Reduce(degradate) => {
+                // Уменьшаем на основе реального битрейта, но не ниже минимального порога
+                let new_bitrate =
+                    std::cmp::max(real_bitrate * (100 - degradate) / 100, min_bitrate);
+
+                if new_bitrate < current_target
+                    && new_bitrate.abs_diff(current_target) > change_threshold
+                {
+                    log::warn!(
+                        "\nУменьшение битрейта: target={}bps -> {}bps, real={}bps",
+                        current_target,
+                        new_bitrate,
+                        real_bitrate,
+                    );
+                    // Сохраняем последнее время отправки
+                    self.last_remb_sent
+                        .store(self.instant_to_micros(Instant::now()), Ordering::SeqCst);
+                    self.current_target_bitrate_bps
+                        .store(new_bitrate, Ordering::SeqCst);
+                    Some(new_bitrate)
+                } else {
+                    None
+                }
+            }
+            ReduceIncrease::Increase => {
+                // Увеличиваем осторожно, проверяя что реальный битрейт может поддерживаться
+                let proposed_increase = real_bitrate + min_bitrate;
+
+                // Не увеличиваем больше чем на 50% от реального битрейта за раз
+                // Битрейт не может быть больше максимального
+                let max_safe_increase = real_bitrate + (real_bitrate / 2);
+                let new_bitrate = std::cmp::min(proposed_increase, max_safe_increase);
+                let new_bitrate = std::cmp::min(new_bitrate, self.max_bitrate_bps);
+
+                if new_bitrate > current_target
+                    && new_bitrate.abs_diff(current_target) > change_threshold
+                {
+                    log::warn!(
+                        "\nУвеличение битрейта: target={}bps -> {}bps, real={}bps",
+                        current_target,
+                        new_bitrate,
+                        real_bitrate,
+                    );
+                    // Сохраняем последнее время отправки
+                    self.last_remb_sent
+                        .store(self.instant_to_micros(Instant::now()), Ordering::SeqCst);
+                    self.current_target_bitrate_bps
+                        .store(new_bitrate, Ordering::SeqCst);
+                    Some(new_bitrate)
+                } else {
+                    None
+                }
+            }
+            ReduceIncrease::NoChange => None,
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use arc_swap::ArcSwapOption;
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use crossbeam_utils::CachePadded;
-use log::warn;
+// use log::warn;
 use rtp::packet::Packet;
 use std::{
     sync::Arc,
@@ -51,24 +51,24 @@ impl PCacheBuffer {
         match cell.load_full() {
             Some(entry) => {
                 if entry.rtp.header.sequence_number != seq {
-                    warn!(
-                        "Коллизия кольца entry.seq {} != seq{}",
-                        entry.rtp.header.sequence_number, seq
-                    );
+                    // warn!(
+                    //     "Коллизия кольца entry.seq {} != seq{}",
+                    //     entry.rtp.header.sequence_number, seq
+                    // );
                     return None;
                 }
                 if entry.first_sent_at.elapsed() > self.ttl {
-                    warn!(
-                        "Пакет просрочен {:?} > {:?}",
-                        entry.first_sent_at.elapsed(),
-                        self.ttl
-                    );
+                    // warn!(
+                    //     "Пакет просрочен {:?} > {:?}",
+                    //     entry.first_sent_at.elapsed(),
+                    //     self.ttl
+                    // );
                     return None;
                 }
                 Some(entry)
             }
             None => {
-                warn!("LoadFull is None");
+                // warn!("LoadFull is None");
                 None
             }
         }
