@@ -5,12 +5,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use dashmap::DashMap;
 use interceptor::stream_info::{AssociatedStreamInfo, RTPHeaderExtension};
 use interceptor::Interceptor;
-use log::trace;
 use smol_str::SmolStr;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::api::media_engine::MediaEngine;
 use crate::dtls_transport::RTCDtlsTransport;
@@ -152,7 +150,7 @@ pub struct RTPReceiverInternal {
     state_tx: watch::Sender<State>,
     state_rx: watch::Receiver<State>,
 
-    tracks: DashMap<usize, TrackStreams>,
+    tracks: RwLock<Vec<TrackStreams>>,
 
     transceiver_codecs: ArcSwapOption<Mutex<Vec<RTCRtpCodecParameters>>>,
 
@@ -189,12 +187,16 @@ impl RTPReceiverInternal {
         //     Err(Error::ErrExistingTrack)
         // }
 
+        // Это работает чуть быстрее, чем если использовать код выше
         let rtcp_interceptor = {
-            let t = self.tracks.get(&0).ok_or(Error::ErrExistingTrack)?;
+            let tracks = self.tracks.read().await; // Блокировка захвачена
 
             // TODO: возможно, нужна логика выбора трека на основе симулкаст предпочтения
             // Вместо того, чтоб просто брать первый трек, или читать оповещения от всех треков
-            t.stream
+            tracks
+                .first()
+                .ok_or(Error::ErrExistingTrack)?
+                .stream
                 .rtcp_interceptor
                 .as_ref()
                 .ok_or(Error::ErrInterceptorNotBind)?
@@ -225,10 +227,8 @@ impl RTPReceiverInternal {
         // isn't flowing.
         State::wait_for(&mut state_watch_rx, &[State::Started, State::Paused]).await?;
 
-        // let tracks = self.tracks.read().await;
-        let tracks = self.tracks.iter_mut().collect::<Vec<_>>();
-        for mut tv in tracks {
-            let t = tv.value_mut();
+        let tracks = self.tracks.read().await;
+        for t in &*tracks {
             if t.track.rid() == rid {
                 if let Some(rtcp_interceptor) = &t.stream.rtcp_interceptor {
                     loop {
@@ -256,9 +256,8 @@ impl RTPReceiverInternal {
         receive_mtu: usize,
     ) -> Result<Vec<Box<dyn rtcp::packet::Packet + Send + Sync>>> {
         let mut b = vec![0u8; receive_mtu];
-        let pkts = self.read(&mut b).await?;
 
-        Ok(pkts)
+        Ok(self.read(&mut b).await?)
     }
 
     /// read_simulcast_rtcp is a convenience method that wraps ReadSimulcast and unmarshal for you
@@ -274,61 +273,122 @@ impl RTPReceiverInternal {
     }
 
     pub(crate) async fn read_rtp(&self, b: &mut [u8], tid: usize) -> Result<rtp::packet::Packet> {
+        // println!("Начали чтение");
+        // let mut state_watch_rx = self.state_tx.subscribe();
+
+        // // Ensure we are running.
+        // State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
+
+        // //log::debug!("read_rtp enter tracks tid {}", tid);
+        // let mut rtp_interceptor = None;
+        // //let mut ssrc = 0;
+        // {
+        //     let tracks = self.tracks.read().await;
+        //     for t in &*tracks {
+        //         if t.track.tid() == tid {
+        //             rtp_interceptor.clone_from(&t.stream.rtp_interceptor);
+        //             //ssrc = t.track.ssrc();
+        //             break;
+        //         }
+        //     }
+        // };
+        // /*log::debug!(
+        //     "read_rtp exit tracks with rtp_interceptor {} with tid {}",
+        //     rtp_interceptor.is_some(),
+        //     tid,
+        // );*/
+        // if let Some(rtp_interceptor) = rtp_interceptor {
+        //     //println!(
+        //     //    "read_rtp rtp_interceptor.read enter with tid {} ssrc {}",
+        //     //    tid, ssrc
+        //     //);
+        //     let mut current_state = *state_watch_rx.borrow();
+        //     loop {
+        //         tokio::select! {
+        //             _ = state_watch_rx.changed() => {
+        //                 let new_state = *state_watch_rx.borrow();
+
+        //                 if new_state == State::Stopped {
+        //                     return Err(Error::ErrClosedPipe);
+        //                 }
+        //                 current_state = new_state;
+        //             }
+        //             result = rtp_interceptor.read(b) => {
+        //                 let result = result?;
+
+        //                 if current_state == State::Paused {
+        //                     log::trace!("Dropping {} read bytes received while RTPReceiver was paused", result);
+        //                     continue;
+        //                 }
+        //                 return Ok(result);
+        //             }
+        //         }
+        //     }
+        // } else {
+        //     //log::debug!("read_rtp exit tracks with ErrRTPReceiverWithSSRCTrackStreamNotFound");
+        //     Err(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)
+        // }
+
         let mut state_watch_rx = self.state_tx.subscribe();
 
         // Ensure we are running.
         State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
 
-        //log::debug!("read_rtp enter tracks tid {}", tid);
-        let mut rtp_interceptor = None;
-        //let mut ssrc = 0;
-        {
-            let tracks = self.tracks.iter_mut().collect::<Vec<_>>();
-            for mut tv in tracks {
-                let t = tv.value_mut();
-                if t.track.tid() == tid {
-                    rtp_interceptor.clone_from(&t.stream.rtp_interceptor);
-                    //ssrc = t.track.ssrc();
-                    break;
+        // println!("read_rtp enter tracks tid {}", tid);
+        let rtp_interceptor = {
+            let tracks = self.tracks.read().await;
+            tracks
+                .iter()
+                .find(|t| t.track.tid() == tid)
+                .ok_or(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)?
+                .stream
+                .rtp_interceptor
+                .as_ref()
+                .ok_or(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)?
+                .clone()
+        };
+
+        loop {
+            let current_state = *state_watch_rx.borrow();
+
+            match current_state {
+                State::Stopped => {
+                    return Err(Error::ErrClosedPipe);
+                }
+                State::Started => {}
+                _ => {
+                    State::wait_for(&mut state_watch_rx, &[State::Started]).await?;
                 }
             }
-        };
-        /*log::debug!(
-            "read_rtp exit tracks with rtp_interceptor {} with tid {}",
-            rtp_interceptor.is_some(),
-            tid,
-        );*/
 
-        if let Some(rtp_interceptor) = rtp_interceptor {
-            //println!(
-            //    "read_rtp rtp_interceptor.read enter with tid {} ssrc {}",
-            //    tid, ssrc
-            //);
-            let mut current_state = *state_watch_rx.borrow();
-            loop {
-                tokio::select! {
-                    _ = state_watch_rx.changed() => {
-                        let new_state = *state_watch_rx.borrow();
+            tokio::select! {
+                res = state_watch_rx.changed() => {
+                    if let Err(_) = res {
+                        return Err(Error::ErrClosedPipe);
+                    }
+                    let new_state = *state_watch_rx.borrow();
 
-                        if new_state == State::Stopped {
+                    if new_state == State::Stopped {
+                        return Err(Error::ErrClosedPipe);
+                    }
+                    continue;
+                }
+                result = rtp_interceptor.read(b) => {
+                    let result = result?;
+
+                    let current_state = *state_watch_rx.borrow();
+                    match current_state {
+                        State::Stopped => {
                             return Err(Error::ErrClosedPipe);
                         }
-                        current_state = new_state;
-                    }
-                    result = rtp_interceptor.read(b) => {
-                        let result = result?;
-
-                        if current_state == State::Paused {
-                            trace!("Dropping {} read bytes received while RTPReceiver was paused", result);
+                        State::Paused => {
                             continue;
                         }
-                        return Ok(result);
+                        _ => {}
                     }
+                    return Ok(result);
                 }
             }
-        } else {
-            //log::debug!("read_rtp exit tracks with ErrRTPReceiverWithSSRCTrackStreamNotFound");
-            Err(Error::ErrRTPReceiverWithSSRCTrackStreamNotFound)
         }
     }
 
@@ -445,8 +505,7 @@ impl RTCRtpReceiver {
             internal: Arc::new(RTPReceiverInternal {
                 kind,
 
-                // tracks: RwLock::new(vec![]),
-                tracks: DashMap::with_capacity(3),
+                tracks: RwLock::new(vec![]),
                 transport,
                 media_engine,
                 interceptor,
@@ -495,40 +554,26 @@ impl RTCRtpReceiver {
             });
         }
 
-        // let mut tracks = self.internal.tracks.write().await;
+        let mut tracks = self.internal.tracks.write().await;
         for (idx, codec) in params.codecs.iter().enumerate() {
-            // let t = &mut tracks[idx];
-            // if let Some(stream_info) = &mut t.stream.stream_info {
-            //     stream_info
-            //         .rtp_header_extensions
-            //         .clone_from(&header_extensions);
-            // }
-
-            // let current_track = &t.track;
-            // current_track.set_codec(codec.clone());
-            // current_track.set_params(params.clone());
-
-            if let Some(mut t) = self.internal.tracks.get_mut(&idx) {
-                if let Some(stream_info) = &mut t.stream.stream_info {
-                    stream_info
-                        .rtp_header_extensions
-                        .clone_from(&header_extensions);
-                }
-
-                t.track.set_codec(codec.clone());
-                t.track.set_params(params.clone());
+            let t = &mut tracks[idx];
+            if let Some(stream_info) = &mut t.stream.stream_info {
+                stream_info
+                    .rtp_header_extensions
+                    .clone_from(&header_extensions);
             }
+
+            let current_track = &t.track;
+            current_track.set_codec(codec.clone());
+            current_track.set_params(params.clone());
         }
     }
 
     /// tracks returns the RtpTransceiver traclockks
     /// A RTPReceiver to support Simulcast may now have multiple tracks
     pub async fn tracks(&self) -> Vec<Arc<TrackRemote>> {
-        self.internal
-            .tracks
-            .iter()
-            .map(|t| Arc::clone(&t.value().track))
-            .collect()
+        let tracks = self.internal.tracks.read().await;
+        tracks.iter().map(|t| Arc::clone(&t.track)).collect()
     }
 
     /// receive initialize the track and starts all the transports
@@ -555,7 +600,7 @@ impl RTCRtpReceiver {
             RTCRtpCodecParameters::default()
         };
 
-        for (idx, encoding) in parameters.encodings.iter().enumerate() {
+        for encoding in &parameters.encodings {
             let (stream_info, rtp_read_stream, rtp_interceptor, rtcp_read_stream, rtcp_interceptor) =
                 if encoding.ssrc != 0 {
                     let stream_info = create_stream_info(
@@ -611,10 +656,8 @@ impl RTCRtpReceiver {
             };
 
             {
-                // let mut tracks = self.internal.tracks.write().await;
-                // tracks.push(t.clone());
-
-                self.internal.tracks.insert(idx, t);
+                let mut tracks = self.internal.tracks.write().await;
+                tracks.push(t);
             };
 
             let rtx_ssrc = encoding.rtx.ssrc;
@@ -740,53 +783,44 @@ impl RTCRtpReceiver {
         let mut errs = vec![];
         let was_ever_started = previous_state.is_started();
         if was_ever_started {
-            // let tracks = self.internal.tracks.write().await;
-            let keys: Vec<_> = self
-                .internal
-                .tracks
-                .iter()
-                .map(|kv| kv.key().clone())
-                .collect();
-            for k in keys {
-                if let Some(tv) = self.internal.tracks.get(&k) {
-                    let t = tv.value();
-                    if let Some(rtcp_read_stream) = &t.stream.rtcp_read_stream {
-                        if let Err(err) = rtcp_read_stream.close().await {
-                            errs.push(err);
-                        }
+            let tracks = self.internal.tracks.write().await;
+            for t in &*tracks {
+                if let Some(rtcp_read_stream) = &t.stream.rtcp_read_stream {
+                    if let Err(err) = rtcp_read_stream.close().await {
+                        errs.push(err);
                     }
+                }
 
-                    if let Some(rtp_read_stream) = &t.stream.rtp_read_stream {
-                        if let Err(err) = rtp_read_stream.close().await {
-                            errs.push(err);
-                        }
+                if let Some(rtp_read_stream) = &t.stream.rtp_read_stream {
+                    if let Err(err) = rtp_read_stream.close().await {
+                        errs.push(err);
                     }
+                }
 
-                    if let Some(repair_rtcp_read_stream) = &t.repair_stream.rtcp_read_stream {
-                        if let Err(err) = repair_rtcp_read_stream.close().await {
-                            errs.push(err);
-                        }
+                if let Some(repair_rtcp_read_stream) = &t.repair_stream.rtcp_read_stream {
+                    if let Err(err) = repair_rtcp_read_stream.close().await {
+                        errs.push(err);
                     }
+                }
 
-                    if let Some(repair_rtp_read_stream) = &t.repair_stream.rtp_read_stream {
-                        if let Err(err) = repair_rtp_read_stream.close().await {
-                            errs.push(err);
-                        }
+                if let Some(repair_rtp_read_stream) = &t.repair_stream.rtp_read_stream {
+                    if let Err(err) = repair_rtp_read_stream.close().await {
+                        errs.push(err);
                     }
+                }
 
-                    if let Some(stream_info) = &t.stream.stream_info {
-                        self.internal
-                            .interceptor
-                            .unbind_remote_stream(stream_info)
-                            .await;
-                    }
+                if let Some(stream_info) = &t.stream.stream_info {
+                    self.internal
+                        .interceptor
+                        .unbind_remote_stream(stream_info)
+                        .await;
+                }
 
-                    if let Some(repair_stream_info) = &t.repair_stream.stream_info {
-                        self.internal
-                            .interceptor
-                            .unbind_remote_stream(repair_stream_info)
-                            .await;
-                    }
+                if let Some(repair_stream_info) = &t.repair_stream.stream_info {
+                    self.internal
+                        .interceptor
+                        .unbind_remote_stream(repair_stream_info)
+                        .await;
                 }
             }
         }
@@ -807,9 +841,8 @@ impl RTCRtpReceiver {
         params: RTCRtpParameters,
         stream: TrackStream,
     ) -> Result<Arc<TrackRemote>> {
-        let tracks = self.internal.tracks.iter_mut().collect::<Vec<_>>();
-        for mut tv in tracks {
-            let t = tv.value_mut();
+        let mut tracks = self.internal.tracks.write().await;
+        for t in &mut *tracks {
             if *t.track.rid() == rid {
                 t.track.set_kind(self.internal.kind);
                 if let Some(codec) = params.codecs.first() {
@@ -835,10 +868,9 @@ impl RTCRtpReceiver {
         rsid: String,
         repair_stream: TrackStream,
     ) -> Result<()> {
-        let tracks = self.internal.tracks.iter_mut().collect::<Vec<_>>();
+        let mut tracks = self.internal.tracks.write().await;
         let l = tracks.len();
-        for mut tv in tracks {
-            let t = tv.value_mut();
+        for t in &mut *tracks {
             if (ssrc != 0 && l == 1) || t.track.rid() == rsid {
                 t.repair_stream = repair_stream;
 
@@ -875,10 +907,9 @@ impl RTCRtpReceiver {
             return Ok(());
         }
 
-        let streams = self.internal.tracks.iter_mut().collect::<Vec<_>>();
+        let streams = self.internal.tracks.read().await;
 
-        for mut vk in streams {
-            let stream = vk.value_mut();
+        for stream in streams.iter() {
             // TODO: If we introduce futures as a direct dependency this and other futures could be
             // ran concurrently with [`join_all`](https://docs.rs/futures/0.3.21/futures/future/fn.join_all.html)
             stream.track.fire_onmute().await;
@@ -894,10 +925,9 @@ impl RTCRtpReceiver {
             return Ok(());
         }
 
-        let streams = self.internal.tracks.iter_mut().collect::<Vec<_>>();
+        let streams = self.internal.tracks.read().await;
 
-        for mut vk in streams {
-            let stream = vk.value_mut();
+        for stream in streams.iter() {
             // TODO: If we introduce futures as a direct dependency this and other futures could be
             // ran concurrently with [`join_all`](https://docs.rs/futures/0.3.21/futures/future/fn.join_all.html)
             stream.track.fire_onunmute().await;

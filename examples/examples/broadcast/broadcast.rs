@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
             let _ = local_track_chan_tx2.send(Arc::clone(&local_track)).await;
 
             // Read RTP packets being sent to webrtc-rs
-            while let Ok((rtp, _)) = track.read_rtp().await {
+            while let Ok(rtp) = track.read_rtp().await {
                 if let Err(err) = local_track.write_rtp(&rtp).await {
                     if Error::ErrClosedPipe != err {
                         print!("output track write_rtp got error: {err} and break");
@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
             // like NACK this needs to be called.
             tokio::spawn(async move {
                 let mut rtcp_buf = vec![0u8; 1500];
-                while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+                while let Ok(_) = rtp_sender.read(&mut rtcp_buf).await {}
                 Result::<()>::Ok(())
             });
 

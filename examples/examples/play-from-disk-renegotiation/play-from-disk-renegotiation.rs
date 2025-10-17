@@ -187,7 +187,7 @@ async fn add_video(
     // like NACK this needs to be called.
     tokio::spawn(async move {
         let mut rtcp_buf = vec![0u8; 1500];
-        while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+        while let Ok(_) = rtp_sender.read(&mut rtcp_buf).await {}
         Result::<()>::Ok(())
     });
 

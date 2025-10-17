@@ -1,5 +1,11 @@
+mod bitrate_state;
+mod loss_stats;
+mod packet_cache;
+mod track_state;
+
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
+use futures::{stream, StreamExt};
 use rtcp::reception_report::ReceptionReport;
 use std::any::Any;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -11,153 +17,13 @@ use tokio::sync::Mutex;
 use util::{Marshal, MarshalSize};
 
 use super::*;
-use crate::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8};
-use crate::track::track_local::bitrate_state::BitrateState;
-use crate::track::track_local::loss_stats::{ReceiverLossStats, ReduceIncrease};
-use crate::track::track_local::packet_cache::PCache;
+use crate::api::media_engine::{MIME_TYPE_H264, MIME_TYPE_OPUS, MIME_TYPE_VP8, MIME_TYPE_VP9};
+use crate::error::flatten_errs;
 use crate::track::track_remote::TrackRemote;
-use crate::{error::flatten_errs, track::track_local::packet_cache::PCacheBuffer};
-
-#[derive(Clone, Debug)]
-pub struct TrackState {
-    last_out_seq: u16, // переживает все переключения источников
-    last_out_ts: u32,  // переживает все переключения источников
-    started_at_ts: i64,
-    marker: bool, // marker = true означает, что это последний пакет видеофрейма.
-    // Это сигнал для джиттер-буфера и декодера, что можно собрать все полученные пакеты этого фрейма и отправить их на декодирование.
-    // Используется после паузы
-    out_offset: Option<(
-        u16, /* смещение порядкового номера */
-        u32, /* смещение временной метки timestamp */
-    )>,
-}
-
-pub struct PkgAttrs {
-    sequence_number: u16,
-    timestamp: u32,
-    marker: bool,
-}
-
-impl TrackState {
-    pub fn new() -> Self {
-        TrackState {
-            // Порядковый номер начинается с 0
-            last_out_seq: 0,
-            // время трека начинается с 0
-            last_out_ts: 0,
-            // Сохраняем начало трека в реальной временной шкале дла последующей синхронизации
-            started_at_ts: chrono::Utc::now().timestamp(),
-            out_offset: None,
-            marker: false,
-        }
-    }
-
-    pub fn get_pkg_attrs(
-        &mut self,
-        kind: RTPCodecType,
-        pkt_sequence_number: u16,
-        pkt_timestamp: u32,
-    ) -> PkgAttrs {
-        match self.out_offset {
-            Some((seq_num_offset, ts_offset)) => PkgAttrs {
-                sequence_number: pkt_sequence_number.wrapping_add(seq_num_offset),
-                timestamp: pkt_timestamp.wrapping_add(ts_offset),
-                marker: self.marker,
-            },
-            None => {
-                let seq_num_offset = self
-                    .last_out_seq
-                    .wrapping_sub(pkt_sequence_number)
-                    .wrapping_add(1);
-                let ts_offset =
-                    self.last_out_ts
-                        .wrapping_sub(pkt_timestamp)
-                        .wrapping_add(match kind {
-                            RTPCodecType::Audio => 900,  // стандартное значение для звука
-                            RTPCodecType::Video => 3750, // 90000 clock_rate / 24 кадра
-                            _ => 3750,
-                        });
-                self.out_offset = Some((seq_num_offset, ts_offset));
-
-                PkgAttrs {
-                    sequence_number: pkt_sequence_number.wrapping_add(seq_num_offset),
-                    timestamp: pkt_timestamp.wrapping_add(ts_offset),
-                    marker: self.marker,
-                }
-            }
-        }
-    }
-
-    pub fn set_last_out(&mut self, pkg_attrs: PkgAttrs) {
-        self.last_out_seq = pkg_attrs.sequence_number;
-        self.last_out_ts = pkg_attrs.timestamp;
-        self.marker = false;
-    }
-
-    pub fn shift_offset(&mut self, pkt_sequence_number: u16, pkt_timestamp: u32) {
-        self.marker = true;
-        self.out_offset = Some((
-            self.last_out_seq.wrapping_sub(pkt_sequence_number),
-            self.last_out_ts.wrapping_sub(pkt_timestamp),
-        ))
-    }
-
-    pub fn get_pkg_attrs_set_last_out(
-        &mut self,
-        kind: RTPCodecType,
-        pkt_sequence_number: u16,
-        pkt_timestamp: u32,
-    ) -> PkgAttrs {
-        match self.out_offset {
-            Some((seq_num_offset, ts_offset)) => {
-                // новый = пришедший + смещение
-                // старый = новый - (новый - старый)
-                self.last_out_seq = pkt_sequence_number.wrapping_add(seq_num_offset);
-                self.last_out_ts = pkt_timestamp.wrapping_add(ts_offset);
-                PkgAttrs {
-                    sequence_number: self.last_out_seq,
-                    timestamp: self.last_out_ts,
-                    marker: self.marker,
-                }
-            }
-            None => {
-                let seq_num_offset = self
-                    .last_out_seq
-                    .wrapping_sub(pkt_sequence_number)
-                    .wrapping_add(1);
-                let ts_offset =
-                    self.last_out_ts
-                        .wrapping_sub(pkt_timestamp)
-                        .wrapping_add(match kind {
-                            RTPCodecType::Audio => 900,  // стандартное значение для звука
-                            RTPCodecType::Video => 6000, // 90000 clock_rate / 24 кадра
-                            _ => 6000,
-                        });
-                self.out_offset = Some((seq_num_offset, ts_offset));
-
-                self.last_out_seq = pkt_sequence_number.wrapping_add(seq_num_offset);
-                self.last_out_ts = pkt_timestamp.wrapping_add(ts_offset);
-
-                // println!(
-                //     "Смещения перезаписаны seq_num: {pkt_sequence_number} -> {}; ts: {pkt_timestamp} -> {}",
-                //     self.last_out_seq, self.last_out_ts
-                // );
-                PkgAttrs {
-                    sequence_number: self.last_out_seq,
-                    timestamp: self.last_out_ts,
-                    marker: self.marker,
-                }
-            }
-        }
-    }
-
-    pub fn origin_seq(&self, modified_seq: u16) -> u16 {
-        match self.out_offset {
-            Some((seq_num_offset, _)) => modified_seq.wrapping_sub(seq_num_offset),
-            None => modified_seq,
-        }
-    }
-}
+use bitrate_state::BitrateState;
+use loss_stats::{ReceiverLossStats, ReduceIncrease};
+use packet_cache::{PCache, PCacheBuffer};
+use track_state::{PkgAttrs, TrackState};
 
 /// TrackLocalStaticRTP  is a TrackLocal that has a pre-set codec and accepts RTP Packets.
 /// If you wish to send a media.Sample use TrackLocalStaticSample
@@ -202,7 +68,7 @@ const REMB_INTERVAL: Duration = Duration::from_secs(1);
 fn get_max_bitrate(mime_type: &str) -> u32 {
     match mime_type {
         MIME_TYPE_OPUS => MAX_AUDIO_BITRATE_BPS,
-        MIME_TYPE_H264 | MIME_TYPE_VP8 => MAX_VIDEO_BITRATE_BPS,
+        MIME_TYPE_H264 | MIME_TYPE_VP8 | "video/vp8" | MIME_TYPE_VP9 => MAX_VIDEO_BITRATE_BPS,
         x => panic!("Неподдерживаемый тип кодека! {}", x),
     }
 }
@@ -248,35 +114,9 @@ impl TrackLocalStaticRTP {
         rid: String,
         stream_id: String,
     ) -> Self {
-        let max_bitrate_bps = get_max_bitrate(&codec.mime_type);
-        let start_remb_time = Instant::now();
-        // Начинаем с "10 секунд назад", чтобы можно было отправить сразу
-        let initial_offset = Duration::from_secs(10).as_micros() as u64;
-        TrackLocalStaticRTP {
-            codec,
-            bindings: DashMap::with_capacity(10),
-            id,
-            rid: Some(rid),
-            stream_id,
-
-            state: Mutex::new(TrackState::new()),
-            rtp_cache: Arc::new(PCacheBuffer::new(
-                Duration::from_millis(TTL_MILLIS),
-                CAPACITY,
-            )),
-
-            pli_last_ms: AtomicU64::new(0),
-            pli_interval_ms: PLI_INTERVAL_MS,
-
-            bitrate: Mutex::new(BitrateState::new()),
-            loss_stats: Mutex::new(ReceiverLossStats::new()),
-            max_bitrate_bps,
-            current_target_bitrate_bps: AtomicU32::new(max_bitrate_bps / 2),
-
-            last_remb_sent: AtomicU64::new(initial_offset),
-            start_remb_time,
-            min_remb_interval: REMB_INTERVAL,
-        }
+        let mut track = TrackLocalStaticRTP::new(codec, id, stream_id);
+        track.rid = Some(rid);
+        track
     }
 
     /// codec gets the Codec of the track
@@ -379,6 +219,8 @@ impl TrackLocalStaticRTP {
     }
 
     /// Получаем ssrc всех RTCPeerConnection подключений к этому треку
+    /// в терминах отправителя трека.
+    /// Используется для отчёта
     pub fn bindings_ssrc(&self) -> Vec<u32> {
         self.bindings.iter().map(|b| b.key().clone()).collect()
     }
@@ -418,7 +260,11 @@ impl TrackLocalStaticRTP {
                 return Err(err);
             }
 
-            self.write_rtp_with_extensions_to_binding(p, pkt_attrs, &extension_data, b)
+            let mut p = p.clone();
+            p.header.timestamp = pkt_attrs.timestamp;
+            p.header.sequence_number = pkt_attrs.sequence_number;
+
+            self.write_rtp_with_extensions_to_binding(p, extension_data.clone(), b)
                 .await
         } else {
             // Must return Ok(usize) to be consistent with write_rtp_with_extensions_attributes
@@ -446,7 +292,7 @@ impl TrackLocalStaticRTP {
             )
         };
 
-        let mut n = 0;
+        // let mut n = 0;
         let mut write_errs = vec![];
 
         let bindings: Vec<Arc<TrackBinding>> =
@@ -470,17 +316,28 @@ impl TrackLocalStaticRTP {
             })
             .collect();
 
-        for b in bindings.into_iter() {
-            match self
-                .write_rtp_with_extensions_to_binding(&pkt, &pkg_attrs, &extension_data, b)
-                .await
-            {
-                Ok(one_or_zero) => {
-                    n += one_or_zero;
+        let concurrency: usize = 4; // подберите под ваши ресурсы
+        let results = stream::iter(bindings)
+            .map(|b| {
+                let mut pkt = pkt.clone();
+                pkt.header.timestamp = pkg_attrs.timestamp;
+                pkt.header.sequence_number = pkg_attrs.sequence_number;
+                let extension_data = extension_data.clone();
+                async move {
+                    self.write_rtp_with_extensions_to_binding(pkt, extension_data, b)
+                        .await
                 }
-                Err(err) => {
-                    write_errs.push(err);
-                }
+            })
+            .buffer_unordered(concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut n = 0;
+        // let mut write_errs = Vec::new();
+        for res in results {
+            match res {
+                Ok(one_or_zero) => n += one_or_zero,
+                Err(e) => write_errs.push(e),
             }
         }
 
@@ -547,18 +404,16 @@ impl TrackLocalStaticRTP {
 
     async fn write_rtp_with_extensions_to_binding(
         &self,
-        p: &rtp::packet::Packet,
-        pkg_attrs: &PkgAttrs,
-        extension_data: &HashMap<Cow<'static, str>, Bytes>,
+        mut pkt: rtp::packet::Packet,
+        extension_data: HashMap<Cow<'static, str>, Bytes>,
         binidng: Arc<TrackBinding>,
     ) -> Result<usize> {
         if binidng.is_sender_paused() {
             return Ok(0);
         }
 
-        let mut pkt = p.clone();
-        pkt.header.sequence_number = pkg_attrs.sequence_number;
-        pkt.header.timestamp = pkg_attrs.timestamp;
+        // pkt.header.sequence_number = pkg_attrs.sequence_number;
+        // pkt.header.timestamp = pkg_attrs.timestamp;
         pkt.header.ssrc = binidng.ssrc;
         pkt.header.payload_type = binidng.payload_type;
 

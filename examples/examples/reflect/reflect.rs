@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
         let m = s.to_owned();
         tokio::spawn(async move {
             let mut rtcp_buf = vec![0u8; 1500];
-            while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+            while let Ok(_) = rtp_sender.read(&mut rtcp_buf).await {}
             println!("{m} rtp_sender.read loop exit");
             Result::<()>::Ok(())
         });
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
                 track.codec().capability.mime_type
             );
             // Read RTP packets being sent to webrtc-rs
-            while let Ok((rtp, _)) = track.read_rtp().await {
+            while let Ok(rtp) = track.read_rtp().await {
                 if let Err(err) = output_track2.write_rtp(&rtp).await {
                     println!("output track write_rtp got error: {err}");
                     break;

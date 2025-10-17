@@ -2845,6 +2845,7 @@ dependencies = [
  "dashmap",
  "dtls",
  "env_logger",
+ "futures",
  "hex",
  "interceptor",
  "lazy_static",

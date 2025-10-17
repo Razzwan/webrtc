@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             let mut b = vec![0u8; 1500];
-            while let Ok((mut rtp_packet, _)) = track.read(&mut b).await {
+            while let Ok(mut rtp_packet) = track.read(&mut b).await {
                 // Update the PayloadType
                 rtp_packet.header.payload_type = c.payload_type;
 

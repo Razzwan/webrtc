@@ -30,7 +30,7 @@ async fn save_to_disk(
     loop {
         tokio::select! {
             result = track.read_rtp() => {
-                if let Ok((rtp_packet, _)) = result {
+                if let Ok(rtp_packet) = result {
                     let mut w = writer.lock().await;
                     w.write_rtp(&rtp_packet)?;
                 }else{

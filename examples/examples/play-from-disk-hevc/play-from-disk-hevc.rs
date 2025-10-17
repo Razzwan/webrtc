@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
                                 }
                                 m = track.read_rtp() => {
                                     println!("rtp readed");
-                                    if let Ok((p, _)) = m {
+                                    if let Ok(p) = m {
                                         let data = pck.depacketize(&p.payload).unwrap();
                                         match pck.payload() {
                                             H265Payload::H265PACIPacket(p) => {
@@ -398,7 +398,7 @@ async fn offer_worker(
         .await?;
     tokio::spawn(async move {
         let mut rtcp_buf = vec![0u8; 1500];
-        while let Ok((_, _)) = video_rtp_sender.read(&mut rtcp_buf).await {}
+        while let Ok(_) = video_rtp_sender.read(&mut rtcp_buf).await {}
         Result::<()>::Ok(())
     });
     let notify1 = notify_connect.clone();
@@ -471,7 +471,7 @@ async fn offer_worker(
         .await?;
     tokio::spawn(async move {
         let mut rtcp_buf = vec![0u8; 1500];
-        while let Ok((_, _)) = audio_rtp_sender.read(&mut rtcp_buf).await {}
+        while let Ok(_) = audio_rtp_sender.read(&mut rtcp_buf).await {}
         Result::<()>::Ok(())
     });
     let notify1 = notify_connect.clone();

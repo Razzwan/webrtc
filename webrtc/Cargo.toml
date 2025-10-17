@@ -63,6 +63,7 @@ unicase = "2.8"
 parking_lot = "0.12.5"
 crossbeam-utils = "0.8.21"
 crossbeam-epoch = "0.9.18"
+futures = "0.3.31"
 
 [dev-dependencies]
 env_logger = "0.11.3"

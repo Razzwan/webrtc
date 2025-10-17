@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
     // like NACK this needs to be called.
     tokio::spawn(async move {
         let mut rtcp_buf = vec![0u8; 1500];
-        while let Ok((_, _)) = rtp_sender.read(&mut rtcp_buf).await {}
+        while let Ok(_) = rtp_sender.read(&mut rtcp_buf).await {}
         Result::<()>::Ok(())
     });
 
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
 
             let mut last_timestamp = 0;
             let mut is_curr_track = false;
-            while let Ok((mut rtp, _)) = track.read_rtp().await {
+            while let Ok(mut rtp) = track.read_rtp().await {
                 // Change the timestamp to only be the delta
                 let old_timestamp = rtp.header.timestamp;
                 if last_timestamp == 0 {

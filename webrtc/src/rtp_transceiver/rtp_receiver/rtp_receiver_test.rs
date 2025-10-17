@@ -1,8 +1,7 @@
-use std::time::Instant;
-
 use bytes::Bytes;
 use media::Sample;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use waitgroup::WaitGroup;
@@ -533,7 +532,7 @@ async fn test_rtp_receiver_internal_read_single_rtp_latency() -> Result<()> {
     );
 
     // 10) SLA по средней задержке — подстрой под свой CI/окружение
-    let sla_avg = Duration::from_micros(50); // пример: 2 ms
+    let sla_avg = Duration::from_micros(1); // пример: 2 ms
     assert!(
         Duration::from_nanos(avg_ns as u64) <= sla_avg,
         "Average RTP read latency {:.1} µs exceeded SLA {:?}",
