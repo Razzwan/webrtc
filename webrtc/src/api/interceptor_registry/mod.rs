@@ -2,7 +2,7 @@
 mod interceptor_registry_test;
 
 use interceptor::nack::generator::Generator;
-use interceptor::nack::responder::Responder;
+// use interceptor::nack::responder::Responder;
 use interceptor::registry::Registry;
 use interceptor::report::receiver::ReceiverReport;
 use interceptor::report::sender::SenderReport;
@@ -57,8 +57,8 @@ pub fn configure_nack(mut registry: Registry, media_engine: &mut MediaEngine) ->
     );
 
     let generator = Box::new(Generator::builder());
-    let responder = Box::new(Responder::builder());
-    registry.add(responder);
+    // let responder = Box::new(Responder::builder());
+    // registry.add(responder);
     registry.add(generator);
     registry
 }

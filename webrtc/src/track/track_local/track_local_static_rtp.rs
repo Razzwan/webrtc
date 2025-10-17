@@ -6,6 +6,7 @@ mod track_state;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
+use log::warn;
 use rtcp::reception_report::ReceptionReport;
 use std::any::Any;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -495,6 +496,7 @@ impl TrackLocalStaticRTP {
         let real_bitrate = if let Ok(bitrate_guard) = self.bitrate.try_lock() {
             bitrate_guard.average_bitrate()
         } else {
+            warn!("Адаптация битрейта заблокирована BitrateState (self.bitrate)");
             return None;
         };
 
@@ -510,6 +512,7 @@ impl TrackLocalStaticRTP {
         let should_reduce = if let Ok(loss_stats_guard) = self.loss_stats.try_lock() {
             loss_stats_guard.should_reduce()
         } else {
+            warn!("Адаптация битрейта заблокирована ReceiverLossStats (self.loss_stats)");
             return None;
         };
 
