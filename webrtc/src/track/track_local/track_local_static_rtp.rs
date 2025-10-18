@@ -46,6 +46,8 @@ pub struct TrackLocalStaticRTP {
     pub loss_stats: Mutex<ReceiverLossStats>,
 
     pub max_bitrate_bps: u32,
+    pub min_bitrate_bps: u32,
+    pub bitrate_step_bps: u32,
     pub current_target_bitrate_bps: AtomicU32, // Добавляем это поле
 
     last_remb_sent: AtomicU64, // microseconds since start
@@ -61,7 +63,7 @@ const TTL_MILLIS: u64 = 3000;
 
 const PLI_INTERVAL_MS: u64 = 500;
 
-const MAX_VIDEO_BITRATE_BPS: u32 = 1_000_000;
+const MAX_VIDEO_BITRATE_BPS: u32 = 300_000;
 const MAX_AUDIO_BITRATE_BPS: u32 = 64_000;
 
 const REMB_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,10 +76,27 @@ fn get_max_bitrate(mime_type: &str) -> u32 {
     }
 }
 
+fn get_min_bitrate(mime_type: &str) -> u32 {
+    match mime_type {
+        MIME_TYPE_OPUS => MAX_AUDIO_BITRATE_BPS / 4,
+        MIME_TYPE_H264 | MIME_TYPE_VP8 | "video/vp8" | MIME_TYPE_VP9 => MAX_VIDEO_BITRATE_BPS / 6,
+        x => panic!("Неподдерживаемый тип кодека! {}", x),
+    }
+}
+
+fn get_bitrate_step(mime_type: &str) -> u32 {
+    match mime_type {
+        MIME_TYPE_OPUS => MAX_AUDIO_BITRATE_BPS / 20,
+        MIME_TYPE_H264 | MIME_TYPE_VP8 | "video/vp8" | MIME_TYPE_VP9 => MAX_VIDEO_BITRATE_BPS / 20,
+        x => panic!("Неподдерживаемый тип кодека! {}", x),
+    }
+}
+
 impl TrackLocalStaticRTP {
     /// returns a TrackLocalStaticRTP without rid.
     pub fn new(codec: RTCRtpCodecCapability, id: String, stream_id: String) -> Self {
-        let max_bitrate_bps = get_max_bitrate(&codec.mime_type);
+        let mime_type = codec.mime_type.clone();
+        let max_bitrate_bps = get_max_bitrate(&mime_type);
         let start_remb_time = Instant::now();
         // Начинаем с "10 секунд назад", чтобы можно было отправить сразу
         let initial_offset = Duration::from_secs(10).as_micros() as u64;
@@ -100,6 +119,8 @@ impl TrackLocalStaticRTP {
             bitrate: Mutex::new(BitrateState::new()),
             loss_stats: Mutex::new(ReceiverLossStats::new()),
             max_bitrate_bps,
+            min_bitrate_bps: get_min_bitrate(&mime_type),
+            bitrate_step_bps: get_bitrate_step(&mime_type),
             current_target_bitrate_bps: AtomicU32::new(max_bitrate_bps / 2),
 
             last_remb_sent: AtomicU64::new(initial_offset),
@@ -489,9 +510,8 @@ impl TrackLocalStaticRTP {
 
         let current_target = self.current_target_bitrate_bps.load(Ordering::Relaxed);
         // Применяем изменение только если оно существенное (>5% изменения)
-        let change_threshold = current_target / 20;
+        let change_threshold = std::cmp::min(current_target / 20, self.bitrate_step_bps);
         // Выбираем минимально возможный размер битрейта (он же, шаг от изменения)
-        let min_bitrate = self.max_bitrate_bps / 20;
 
         let real_bitrate = if let Ok(bitrate_guard) = self.bitrate.try_lock() {
             bitrate_guard.average_bitrate()
@@ -520,7 +540,7 @@ impl TrackLocalStaticRTP {
             ReduceIncrease::Reduce(degradate) => {
                 // Уменьшаем на основе реального битрейта, но не ниже минимального порога
                 let new_bitrate =
-                    std::cmp::max(real_bitrate * (100 - degradate) / 100, min_bitrate);
+                    std::cmp::max(real_bitrate * (100 - degradate) / 100, self.min_bitrate_bps);
 
                 if new_bitrate < current_target
                     && new_bitrate.abs_diff(current_target) > change_threshold
@@ -543,7 +563,7 @@ impl TrackLocalStaticRTP {
             }
             ReduceIncrease::Increase => {
                 // Увеличиваем осторожно, проверяя что реальный битрейт может поддерживаться
-                let proposed_increase = real_bitrate + min_bitrate;
+                let proposed_increase = real_bitrate + self.bitrate_step_bps;
 
                 // Не увеличиваем больше чем на 50% от реального битрейта за раз
                 // Битрейт не может быть больше максимального
