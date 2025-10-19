@@ -134,7 +134,8 @@ impl Generator {
                         nacks
                     };
 
-                    for nack in nacks{
+                    for nack in nacks {
+                        log::warn!("NACK сгенерирован и отправлен: {:#?}", nack);
                         if let Err(err) = rtcp_writer.write(&[Box::new(nack)]).await{
                             log::warn!("failed sending nack: {err}");
                         }

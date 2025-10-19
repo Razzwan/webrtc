@@ -141,7 +141,7 @@ impl TrackRemote {
 
     /// payload_type gets the PayloadType of the track
     pub fn payload_type(&self) -> PayloadType {
-        self.payload_type.load(Ordering::SeqCst)
+        self.payload_type.load(Ordering::Relaxed)
     }
 
     pub fn set_payload_type(&self, payload_type: PayloadType) {
@@ -219,8 +219,11 @@ impl TrackRemote {
             // Internal lock scope
             let mut internal = self.internal.lock().await;
             if let Some(pkt) = internal.peeked.pop_front() {
-                self.check_and_update_track(&pkt).await?;
-
+                // Этот код self.check_and_update_track здесь не нужен,
+                // т.к. проверка происходит только один раз при запуске получателя start_receiver в PeerConnection
+                // В дальнейшем тип нагрузки не может меняться без пересогласования
+                // self.check_and_update_track(&pkt).await?;
+                // log::warn!("track_remote.read 1. PKT: {:#?}", pkt);
                 return Ok(pkt);
             }
         };
@@ -231,15 +234,22 @@ impl TrackRemote {
         };
 
         let pkt = receiver.read_rtp(b, self.tid).await?;
-        self.check_and_update_track(&pkt).await?;
+        // Этот код self.check_and_update_track здесь не нужен,
+        // т.к. проверка происходит только один раз при запуске получателя start_receiver в PeerConnection
+        // В дальнейшем тип нагрузки не может меняться без пересогласования
+        // self.check_and_update_track(&pkt).await?;
+        // log::warn!("track_remote.read 2. PKT: {:#?}", pkt);
         Ok(pkt)
     }
 
     /// check_and_update_track checks payloadType for every incoming packet
     /// once a different payloadType is detected the track will be updated
+    /// Этот код выполняется только один раз, в момент запуска трека.
+    /// В другое время он не нужен, т.к. payload_type измениться не может
     pub(crate) async fn check_and_update_track(&self, pkt: &rtp::packet::Packet) -> Result<()> {
         let payload_type = pkt.header.payload_type;
         if payload_type != self.payload_type() {
+            // log::error!("track_remote.check_and_update_track: У трека изменился payload_type!!! {prev_payload_type} -> {payload_type}");
             let p = self
                 .media_engine
                 .get_rtp_parameters_by_payload_type(payload_type)
@@ -277,15 +287,18 @@ impl TrackRemote {
     }
 
     // Не вызывает лишние блокировки, а всегда читает данные из receiver
-    pub async fn read_rtp_raw(&self) -> Result<rtp::packet::Packet> {
-        let receiver = match self.receiver.as_ref().and_then(|r| r.upgrade()) {
-            Some(r) => r,
-            None => return Err(Error::ErrRTPReceiverNil),
-        };
+    // Нельзя использовать этот метод, т.к. в момент запуска start_receiver в PeerConnection
+    // выполняется проверка чтения из трека и мы один пакет сохраняем в peeked
+    // pub async fn read_rtp_raw(&self) -> Result<rtp::packet::Packet> {
+    //     let receiver = match self.receiver.as_ref().and_then(|r| r.upgrade()) {
+    //         Some(r) => r,
+    //         None => return Err(Error::ErrRTPReceiverNil),
+    //     };
 
-        let mut b = vec![0u8; self.receive_mtu];
-        Ok(receiver.read_rtp(&mut b, self.tid).await?)
-    }
+    //     let mut b = vec![0u8; self.receive_mtu];
+    //     let pkt = receiver.read_rtp(&mut b, self.tid).await?;
+    //     Ok(pkt)
+    // }
 
     /// peek is like Read, but it doesn't discard the packet read
     pub(crate) async fn peek(&self, b: &mut [u8]) -> Result<rtp::packet::Packet> {

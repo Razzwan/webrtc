@@ -25,7 +25,7 @@ pub fn register_default_interceptors(
 
     registry = configure_rtcp_reports(registry);
 
-    registry = configure_twcc_receiver_only(registry, media_engine)?;
+    // registry = configure_twcc_receiver_only(registry, media_engine)?;
 
     Ok(registry)
 }

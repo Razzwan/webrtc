@@ -214,13 +214,18 @@ impl TrackLocalStaticRTP {
         });
 
         // 3. Чтение из remote_track в mpsc канал
-        while let Ok(rtp) = remote_track.read_rtp_raw().await {
+        while let Ok(rtp) = remote_track.read_rtp().await {
             // 1. Сохраняем в кэш оригинальный rtp без смещений! Так быстрее происходит сохранение в кэш
             // При восстановлении кеша нужно вернуть порядковый номер к оригинальному, чтоб найти его
+            // if rtp.header.payload_type != 111 {
+            //     log::warn!("RTP: {:#?}", rtp);
+            // }
+
             let p_cache = Arc::new(PCache {
                 rtp,
                 first_sent_at: Instant::now(),
             });
+
             self.rtp_cache.put(Arc::clone(&p_cache));
 
             // 2. Пытаемся отправить, если переполнен буфер, не ждём и позже в ответ на NACK берём из кэша

@@ -152,6 +152,7 @@ impl RTPReader for GeneratorStream {
     /// read a rtp packet
     async fn read(&self, buf: &mut [u8]) -> Result<rtp::packet::Packet> {
         let pkt = self.parent_rtp_reader.read(buf).await?;
+        // log::warn!("NACK remote reader RTP: {:#?}", pkt);
 
         self.add(pkt.header.sequence_number);
 
