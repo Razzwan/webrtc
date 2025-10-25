@@ -14,6 +14,7 @@ use crate::track::track_local::track_local_static_sample::TrackLocalStaticSample
 use crate::track::TrackStream;
 use crate::SDP_ATTRIBUTE_RID;
 use arc_swap::ArcSwapOption;
+use log::warn;
 use portable_atomic::AtomicIsize;
 use smol_str::SmolStr;
 use tokio::time::Instant;
@@ -1150,6 +1151,7 @@ impl PeerConnectionInternal {
         payload_type: PayloadType,
     ) -> Result<()> {
         let ssrc = rtp_stream.get_ssrc();
+        warn!("Обработка входящего rtp stream ssrc={}", ssrc);
         let parsed = match self.remote_description().await.and_then(|rd| rd.parsed) {
             Some(r) => r,
             None => return Err(Error::ErrPeerConnRemoteDescriptionNil),

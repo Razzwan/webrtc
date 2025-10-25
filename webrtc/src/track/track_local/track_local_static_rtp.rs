@@ -515,7 +515,7 @@ impl TrackLocalStaticRTP {
 
         let current_target = self.current_target_bitrate_bps.load(Ordering::Relaxed);
         // Применяем изменение только если оно существенное (>5% изменения)
-        let change_threshold = std::cmp::min(current_target / 20, self.bitrate_step_bps);
+        let change_min_step = std::cmp::min(current_target / 20, self.bitrate_step_bps);
         // Выбираем минимально возможный размер битрейта (он же, шаг от изменения)
 
         let real_bitrate = if let Ok(bitrate_guard) = self.bitrate.try_lock() {
@@ -547,9 +547,8 @@ impl TrackLocalStaticRTP {
                 let new_bitrate =
                     std::cmp::max(real_bitrate * (100 - degradate) / 100, self.min_bitrate_bps);
 
-                if new_bitrate < current_target
-                    && new_bitrate.abs_diff(current_target) > change_threshold
-                {
+                // Если битрейт уменьшился на величину не меньше, чем минимальный шаг
+                if (current_target - new_bitrate) > change_min_step {
                     log::warn!(
                         "\nУменьшение битрейта: target={}bps -> {}bps, real={}bps",
                         current_target,
@@ -574,11 +573,12 @@ impl TrackLocalStaticRTP {
                 // Битрейт не может быть больше максимального
                 let max_safe_increase = real_bitrate + (real_bitrate / 2);
                 let new_bitrate = std::cmp::min(proposed_increase, max_safe_increase);
-                let new_bitrate = std::cmp::min(new_bitrate, self.max_bitrate_bps);
+                // Запретить рост битрейта больше половины от максимум по механизму потерянных пакетов
+                // Ещё больше он может расти ТОЛЬКО через механизм TWCC!!!
+                let new_bitrate = std::cmp::min(new_bitrate, self.max_bitrate_bps / 2);
 
-                if new_bitrate > current_target
-                    && new_bitrate.abs_diff(current_target) > change_threshold
-                {
+                // Если битрейт вырос на более чем минимальный шаг, то увеличить его
+                if (new_bitrate - current_target) > change_min_step {
                     log::warn!(
                         "\nУвеличение битрейта: target={}bps -> {}bps, real={}bps",
                         current_target,

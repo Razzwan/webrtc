@@ -112,6 +112,7 @@ impl Generator {
             .take()
             .ok_or(Error::ErrInvalidCloseRx)?;
 
+        // TODO: взять реальный sender_ssrc, о котором уже знает отправитель данных
         let sender_ssrc = rand::random::<u32>();
         loop {
             tokio::select! {
