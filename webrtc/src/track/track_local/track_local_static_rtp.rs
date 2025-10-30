@@ -548,12 +548,15 @@ impl TrackLocalStaticRTP {
                     std::cmp::max(real_bitrate * (100 - degradate) / 100, self.min_bitrate_bps);
 
                 // Если битрейт уменьшился на величину не меньше, чем минимальный шаг
-                if (current_target - new_bitrate) > change_min_step {
+                let change_step = current_target - new_bitrate;
+                if current_target > new_bitrate && change_step > change_min_step {
                     log::warn!(
-                        "\nУменьшение битрейта: target={}bps -> {}bps, real={}bps",
+                        "\nУменьшение битрейта: {}bps -> {}bps, real={}bps; step={}; min_step={}",
                         current_target,
                         new_bitrate,
                         real_bitrate,
+                        change_step,
+                        change_min_step
                     );
                     // Сохраняем последнее время отправки
                     self.last_remb_sent
@@ -578,12 +581,15 @@ impl TrackLocalStaticRTP {
                 let new_bitrate = std::cmp::min(new_bitrate, self.max_bitrate_bps / 2);
 
                 // Если битрейт вырос на более чем минимальный шаг, то увеличить его
-                if (new_bitrate - current_target) > change_min_step {
+                let change_step = new_bitrate - current_target;
+                if new_bitrate > current_target && change_step > change_min_step {
                     log::warn!(
-                        "\nУвеличение битрейта: target={}bps -> {}bps, real={}bps",
+                        "\nУвеличение битрейта: {}bps -> {}bps, real={}bps; step={}; min_step={}",
                         current_target,
                         new_bitrate,
                         real_bitrate,
+                        change_step,
+                        change_min_step
                     );
                     // Сохраняем последнее время отправки
                     self.last_remb_sent
